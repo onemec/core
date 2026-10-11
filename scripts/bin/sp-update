@@ -610,10 +610,13 @@ fi
 # Ensure sleepypod service user has journal read access for the Web log viewer (/debug, /system/logs).
 # On pods where /run/log/journal is restricted to group systemd-journal (02750), User=sleepypod
 # needs SupplementaryGroups=systemd-journal (or adm on images without systemd-journal) to run journalctl.
+_group_exists() {
+  getent group "$1" &>/dev/null || grep -q "^$1:" /etc/group 2>/dev/null
+}
 supp_group=""
-if getent group systemd-journal &>/dev/null; then
+if _group_exists systemd-journal; then
   supp_group="systemd-journal"
-elif getent group adm &>/dev/null; then
+elif _group_exists adm; then
   supp_group="adm"
 fi
 if [ -n "$supp_group" ]; then

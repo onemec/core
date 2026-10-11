@@ -792,12 +792,15 @@ fi
 
 # Add sleepypod and dac to systemd-journal (or adm on images without it) so the
 # Next.js /system/logs endpoint can run journalctl without permission errors.
-if getent group systemd-journal &>/dev/null; then
+_group_exists() {
+  getent group "$1" &>/dev/null || grep -q "^$1:" /etc/group 2>/dev/null
+}
+if _group_exists systemd-journal; then
   usermod -aG systemd-journal sleepypod 2>/dev/null || true
   if id dac &>/dev/null; then
     usermod -aG systemd-journal dac 2>/dev/null || true
   fi
-elif getent group adm &>/dev/null; then
+elif _group_exists adm; then
   usermod -aG adm sleepypod 2>/dev/null || true
   if id dac &>/dev/null; then
     usermod -aG adm dac 2>/dev/null || true
@@ -1389,12 +1392,12 @@ mkdir -p /etc/iptables
 # to insufficient permissions" on pods where the journal isn't
 # world-readable.
 SUPP_GROUPS=()
-if getent group dac &>/dev/null; then
+if _group_exists dac; then
   SUPP_GROUPS+=(dac)
 fi
-if getent group systemd-journal &>/dev/null; then
+if _group_exists systemd-journal; then
   SUPP_GROUPS+=(systemd-journal)
-elif getent group adm &>/dev/null; then
+elif _group_exists adm; then
   SUPP_GROUPS+=(adm)
 fi
 SUPP_GROUPS_LINE=""
