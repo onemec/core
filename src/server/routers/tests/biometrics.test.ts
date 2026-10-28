@@ -1,3 +1,4 @@
+import type * as StageViewModule from '@/src/biometrics/profiles/stage-view'
 /**
  * Tests for the biometrics router. Covers happy path of every procedure
  * plus key branches: BAD_REQUEST date-range checks, NOT_FOUND for missing
@@ -40,6 +41,7 @@ const dbMock = vi.hoisted(() => {
     chain.orderBy = vi.fn(() => chain)
     chain.limit = vi.fn(() => chain)
     chain.from = vi.fn(() => chain)
+    chain.leftJoin = vi.fn(() => chain)
     chain.values = vi.fn((v: unknown) => {
       dbState.insertValues.push(v)
       return chain
@@ -90,12 +92,15 @@ const dbMock = vi.hoisted(() => {
 })
 
 // Top-level db mock for device settings (timezone fetch in getSleepStages default)
+// and the side's stored personal model (`.get()`, none stored here, so the rules stage every night).
 const topDbMock = vi.hoisted(() => {
   const makeChain = () => {
     const chain: Record<string, unknown> = {}
     chain.then = (resolve: (v: unknown) => unknown) => Promise.resolve(dbState.settingsRows).then(resolve)
     chain.from = vi.fn(() => chain)
+    chain.where = vi.fn(() => chain)
     chain.limit = vi.fn(() => chain)
+    chain.get = vi.fn(() => undefined)
     return chain
   }
   return { select: vi.fn(() => makeChain()) }
@@ -110,6 +115,7 @@ const sleepStagesMock = vi.hoisted(() => ({
   mergeIntoBlocks: vi.fn(() => [] as { start: number, end: number, stage: 'wake' | 'light' | 'deep' | 'rem' }[]),
   calculateDistribution: vi.fn(() => ({ wake: 0, light: 0, deep: 0, rem: 0 })),
   calculateQualityScore: vi.fn(() => 0),
+  piezoCalibrationQuality: vi.fn(() => 1),
 }))
 
 vi.mock('@/src/db', () => ({
@@ -119,18 +125,30 @@ vi.mock('@/src/db', () => ({
 
 vi.mock('@/src/server/routers/raw', () => rawMock)
 vi.mock('@/src/lib/sleep-stages', () => sleepStagesMock)
+// Runtime profile adoption is integration-tested with real SQLite separately.
+vi.mock('@/src/biometrics/profiles/stage-view', async (importOriginal) => {
+  const actual = await importOriginal<typeof StageViewModule>()
+  const { DEFAULT_STAGE_CLASSIFIER } = await import('@/src/lib/sleep-stage-rules')
+  return { ...actual, consumeStageView: () => ({ classifier: DEFAULT_STAGE_CLASSIFIER, isDefault: true,
+    provenance: { interpretation: 'current_classifier_view', source: 'default', generation: null, revisionId: null,
+      bundleHash: 'fixture', stageHash: 'fixture', manifestHash: null, effectiveSampleTimeMs: null, warning: null } }) }
+})
 
 const occupancyMock = vi.hoisted(() => ({
   getOccupancy: vi.fn<(side: 'left' | 'right') => {
     occupied: boolean
     available: boolean
+    classification: 'person' | 'light' | 'none'
     movement: { active: boolean, peakScore: number }
-    level: { active: boolean, deviation: number | null, threshold: number | null, ageMs: number | null }
+    level: { active: boolean, deviation: number | null, threshold: number | null, ageMs: number | null, zoneDeviations: number[] | null, zones: number | null }
+    vitals: { heartRate: number | null, breathingRate: number | null, humanRange: boolean | null }
   }>(() => ({
     occupied: false,
     available: false,
+    classification: 'none',
     movement: { active: false, peakScore: 0 },
-    level: { active: false, deviation: null, threshold: null, ageMs: null },
+    level: { active: false, deviation: null, threshold: null, ageMs: null, zoneDeviations: null, zones: null },
+    vitals: { heartRate: null, breathingRate: null, humanRange: null },
   })),
 }))
 vi.mock('@/src/lib/occupancy', () => occupancyMock)
@@ -207,16 +225,22 @@ describe('biometrics.getSleepRecords', () => {
     expect(out).toHaveLength(1)
   })
 
-  it('rejects inverted date range', async () => {
+  it('rejects inverted date range as BAD_REQUEST', async () => {
     await expect(caller.getSleepRecords({
       startDate: new Date('2025-02-01'),
       endDate: new Date('2025-01-01'),
       limit: 10,
-    })).rejects.toThrow(/startDate/)
+    })).rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'startDate must be before or equal to endDate' })
   })
 })
 
 describe('biometrics.getVitals', () => {
+  it('allows a full month at 30-second cadence while bounding the response', async () => {
+    dbState.rowsQueue.push([])
+    await expect(caller.getVitals({ side: 'left', limit: 86400 })).resolves.toEqual([])
+    await expect(caller.getVitals({ limit: 100001 })).rejects.toMatchObject({ code: 'BAD_REQUEST' })
+  })
+
   it('returns rows', async () => {
     dbState.rowsQueue.push([
       { id: 1, side: 'left', timestamp: new Date(0), heartRate: 60, hrv: 50, breathingRate: 14 },
@@ -225,12 +249,12 @@ describe('biometrics.getVitals', () => {
     expect(out).toHaveLength(1)
   })
 
-  it('rejects inverted date range', async () => {
+  it('rejects inverted date range as BAD_REQUEST', async () => {
     await expect(caller.getVitals({
       startDate: new Date('2025-02-01'),
       endDate: new Date('2025-01-01'),
       limit: 10,
-    })).rejects.toThrow(/startDate/)
+    })).rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'startDate must be before or equal to endDate' })
   })
 })
 
@@ -320,8 +344,10 @@ describe('biometrics.getOccupancy', () => {
     occupancyMock.getOccupancy.mockImplementation((side: 'left' | 'right') => ({
       occupied: side === 'left',
       available: false,
+      classification: side === 'left' ? 'person' : 'none',
       movement: { active: side === 'left', peakScore: side === 'left' ? 300 : 10 },
-      level: { active: false, deviation: null, threshold: null, ageMs: null },
+      level: { active: false, deviation: null, threshold: null, ageMs: null, zoneDeviations: null, zones: null },
+      vitals: { heartRate: null, breathingRate: null, humanRange: null },
     }))
     const out = await caller.getOccupancy()
     expect(out.left.occupied).toBe(true)
@@ -335,8 +361,10 @@ describe('biometrics.getOccupancy', () => {
     occupancyMock.getOccupancy.mockReturnValue({
       occupied: true,
       available: true,
+      classification: 'light',
       movement: { active: false, peakScore: 5 },
-      level: { active: true, deviation: 12.3, threshold: 6, ageMs: 500 },
+      level: { active: true, deviation: 12.3, threshold: 6, ageMs: 500, zoneDeviations: [11, 0.6, 0.7], zones: 1 },
+      vitals: { heartRate: null, breathingRate: 30, humanRange: false },
     })
     const out = await caller.getOccupancy()
     expect(out.left.available).toBe(true)
@@ -344,6 +372,9 @@ describe('biometrics.getOccupancy', () => {
     expect(out.left.level.threshold).toBe(6)
     expect(out.left.level.ageMs).toBe(500)
     expect(out.left.level.active).toBe(true)
+    expect(out.left.level.zones).toBe(1)
+    expect(out.left.classification).toBe('light')
+    expect(out.left.vitals.humanRange).toBe(false)
   })
 })
 
@@ -604,6 +635,22 @@ describe('biometrics.getSleepStages', () => {
     expect(out.epochs).toHaveLength(1)
     expect(out.qualityScore).toBe(80)
     expect(out.totalSleepMs).toBe(300_000)
+  })
+
+  it('classifies with the side\'s piezo calibration quality', async () => {
+    dbState.rowsQueue.push([{ id: 1, timestamp: new Date(), heartRate: 60, hrv: 50, breathingRate: 14 }])
+    dbState.rowsQueue.push([{ id: 1, timestamp: new Date(), totalMovement: 50 }])
+    dbState.rowsQueue.push([{ qualityScore: 0.2 }])
+    sleepStagesMock.piezoCalibrationQuality.mockImplementationOnce((p?: { qualityScore: number | null } | null) => p?.qualityScore ?? 1)
+    sleepStagesMock.classifySleepStages.mockReturnValue([
+      { start: 0, duration: 300_000, stage: 'light', heartRate: 60, hrv: 50, breathingRate: 14, movement: 50 },
+    ])
+
+    await caller.getSleepStages({ side: 'left', startDate: new Date('2025-01-01'), endDate: new Date('2025-01-02') })
+
+    expect(sleepStagesMock.piezoCalibrationQuality).toHaveBeenCalledWith({ qualityScore: 0.2 })
+    expect(sleepStagesMock.classifySleepStages).toHaveBeenCalledWith(expect.any(Array), expect.any(Array), 0.2, expect.any(Object))
+    expect(sleepStagesMock.calculateQualityScore).toHaveBeenCalledWith(expect.any(Object), 0.2)
   })
 
   it('rejects an inverted custom date range', async () => {
@@ -901,6 +948,7 @@ describe('biometrics error wrapping (INTERNAL_SERVER_ERROR catches)', () => {
       orderBy: vi.fn(() => failingChain),
       limit: vi.fn(() => failingChain),
       from: vi.fn(() => failingChain),
+      leftJoin: vi.fn(() => failingChain),
       values: vi.fn(() => failingChain),
       set: vi.fn(() => failingChain),
       onConflictDoNothing: vi.fn(() => failingChain),
@@ -1591,6 +1639,8 @@ describe('biometrics.getSleepStages query window', () => {
 
     const out = await caller.getSleepStages({ side: 'left', sleepRecordId: 3 })
     expect(out).toEqual({
+      stageView: expect.objectContaining({ provenance: expect.objectContaining({ interpretation: 'current_classifier_view' }) }),
+      stagedBy: { engine: 'rules', version: null },
       epochs: [],
       blocks: [],
       distribution: { wake: 0, light: 0, deep: 0, rem: 0 },

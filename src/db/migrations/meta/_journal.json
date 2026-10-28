@@ -155,6 +155,97 @@
       "when": 1791433565349,
       "tag": "0021_device_time_format",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1791782344042,
+      "tag": "0022_side_stage_classifier",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1791846358026,
+      "tag": "0023_stage_classifier_changes",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1791931740488,
+      "tag": "0024_curve_templates",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "6",
+      "when": 1791932976043,
+      "tag": "0025_schedule_notes",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "6",
+      "when": 1791948350716,
+      "tag": "0026_strong_the_order",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "6",
+      "when": 1791962178346,
+      "tag": "0027_presence_auto_on",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "6",
+      "when": 1791967721108,
+      "tag": "0028_schedule_library",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "6",
+      "when": 1792415320894,
+      "tag": "0029_clear_stale_gesture_alarm_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1792475644291,
+      "tag": "0030_side_stage_models",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1792538319908,
+      "tag": "0031_side_stage_models_active",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1792617694402,
+      "tag": "0032_curious_robin_chapel",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1792676512992,
+      "tag": "0033_alarm_snooze",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "6",
+      "when": 1792676513633,
+      "tag": "0034_alarm_snooze_from_gestures",
+      "breakpoints": true
     }
   ]
 }

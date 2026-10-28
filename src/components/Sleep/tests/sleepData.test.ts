@@ -19,6 +19,7 @@ import {
   toHypnoBlocks,
   toWeekNights,
 } from '../sleepData'
+import { MOVEMENT_ONLY_STAGE_RULESET } from '@/src/lib/sleep-stage-rules'
 
 const at = (d: number, h: number, m = 0) => new Date(2026, 8, d, h, m)
 const rec = (id: number, entered: Date, hours: number, exits = 0) => ({
@@ -140,6 +141,52 @@ describe('week nights', () => {
     expect(night.br).toBe(14)
     expect(night.distribution).not.toBeNull()
     expect(night.quality).toEqual(expect.any(Number))
+  })
+
+  it('classifies with the HR rules unless calibration quality is low', () => {
+    const r = rec(1, at(21, 23), 1)
+    const hrs = [70, 70, 70, 60, 60, 60, 60, 70, 70, 70, 70, 70]
+    const vitals = hrs.map((heartRate, i) => ({
+      timestamp: new Date(at(21, 23).getTime() + i * 300_000),
+      heartRate,
+      hrv: 40,
+      breathingRate: 14,
+    }))
+    const [, calibrated] = buildNights(new Date(2026, 8, 20), 2, [r], vitals, [])
+    const [, lowQuality] = buildNights(new Date(2026, 8, 20), 2, [r], vitals, [], 0.1)
+    expect(calibrated.distribution?.deep).toBeGreaterThan(0)
+    expect(lowQuality.distribution?.deep).toBe(0)
+    expect(lowQuality.quality).toBeLessThanOrEqual(50)
+    const [, movementOnly] = buildNights(new Date(2026, 8, 20), 2, [r], vitals, [], 1, MOVEMENT_ONLY_STAGE_RULESET)
+    expect(movementOnly.distribution?.deep).toBe(0)
+  })
+
+  it('computes no stages or quality while the classifier is unknown, keeping vitals', () => {
+    const r = rec(1, at(21, 23), 1)
+    const vitals = [70, 60, 60, 70].map((heartRate, i) => ({
+      timestamp: new Date(at(21, 23).getTime() + i * 300_000),
+      heartRate,
+      hrv: 40,
+      breathingRate: 14,
+    }))
+    const [, night] = buildNights(new Date(2026, 8, 20), 2, [r], vitals, [], 1, null)
+    expect(night.distribution).toBeNull()
+    expect(night.quality).toBeNull()
+    expect(night.hr).toBe(65)
+  })
+
+  it('keeps vitals but classifies nothing while calibration is unknown', () => {
+    const r = rec(1, at(21, 23), 1)
+    const vitals = [70, 60, 60, 70].map((heartRate, i) => ({
+      timestamp: new Date(at(21, 23).getTime() + i * 300_000),
+      heartRate,
+      hrv: 40,
+      breathingRate: 14,
+    }))
+    const [, night] = buildNights(new Date(2026, 8, 20), 2, [r], vitals, [], null)
+    expect(night.distribution).toBeNull()
+    expect(night.quality).toBeNull()
+    expect(night.hr).toBe(65)
   })
 
   it('normalizes the REM/Light/Deep split and labels bars', () => {

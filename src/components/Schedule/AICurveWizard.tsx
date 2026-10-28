@@ -4,7 +4,6 @@ import { useTimeFormat } from '@/src/providers/TimeFormatProvider'
 import { TimeInput } from './TimeInput'
 import { useCallback, useEffect, useState } from 'react'
 import {
-  X,
   Sparkles,
   Copy,
   Check,
@@ -19,16 +18,14 @@ import {
 import { cn } from '@/lib/utils'
 import { Alert, Button, GhostIcon, Modal, SectionLabel, Stepper } from '@/src/components/ds'
 import { useTemperatureUnit } from '@/src/hooks/useTemperatureUnit'
+import { useCurveTemplates } from '@/src/hooks/useCurveTemplates'
 import { displayToSetpointF, setpointFToDisplay } from '@/src/lib/tempUtils'
 import {
   generatePrompt,
   parseAIResponse,
   EXAMPLE_SUGGESTIONS,
-  loadTemplates,
-  saveTemplate,
-  deleteTemplate,
 } from '@/src/lib/sleepCurve/curvePrompt'
-import type { GeneratedCurve, CurveTemplate, ParseResult } from '@/src/lib/sleepCurve/curvePrompt'
+import type { GeneratedCurve, ParseResult } from '@/src/lib/sleepCurve/curvePrompt'
 import { CurveChart } from './CurveChart'
 import { TONE_VAR, tempTone } from './scheduleFormat'
 
@@ -70,15 +67,10 @@ export function AICurveWizard({ open, onClose, onApply }: AICurveWizardProps) {
   // Step 4: Preview
   const [curve, setCurve] = useState<GeneratedCurve | null>(null)
   const [editablePoints, setEditablePoints] = useState<Array<{ time: string, tempF: number }>>([])
-  const [savedTemplates, setSavedTemplates] = useState<CurveTemplate[]>([])
+  const { save: saveTemplate, isSaving } = useCurveTemplates(open)
+  const [templateError, setTemplateError] = useState<string | null>(null)
 
   /* eslint-disable react-hooks/set-state-in-effect */
-  useEffect(() => {
-    if (open) {
-      setSavedTemplates(loadTemplates())
-    }
-  }, [open])
-
   useEffect(() => {
     if (!open) {
       setStep(0)
@@ -90,6 +82,7 @@ export function AICurveWizard({ open, onClose, onApply }: AICurveWizardProps) {
       setParseResult(null)
       setCurve(null)
       setEditablePoints([])
+      setTemplateError(null)
     }
   }, [open])
 
@@ -190,30 +183,19 @@ export function AICurveWizard({ open, onClose, onApply }: AICurveWizardProps) {
     }
   }, [])
 
-  const handleLoadTemplate = useCallback((template: CurveTemplate) => {
-    setCurve(template)
-    setEditablePoints(
-      Object.entries(template.points)
-        .map(([time, tempF]) => ({ time, tempF }))
-        .sort((a, b) => a.time.localeCompare(b.time)),
-    )
-    setStep(3)
-    setHighestStep(3)
-  }, [])
-
-  const handleDeleteTemplate = useCallback((name: string) => {
-    deleteTemplate(name)
-    setSavedTemplates(loadTemplates())
-  }, [])
-
-  const handleSaveTemplate = useCallback(() => {
+  const handleSaveTemplate = useCallback(async () => {
     if (!curve) return
     const pointsObj: Record<string, number> = {}
     for (const p of editablePoints) pointsObj[p.time] = p.tempF
     const updated: GeneratedCurve = { ...curve, points: pointsObj }
-    saveTemplate(updated)
-    setSavedTemplates(loadTemplates())
-  }, [curve, editablePoints])
+    setTemplateError(null)
+    try {
+      await saveTemplate(updated)
+    }
+    catch (err) {
+      setTemplateError(err instanceof Error ? err.message : 'Save failed')
+    }
+  }, [curve, editablePoints, saveTemplate])
 
   const updatePoint = useCallback((idx: number, field: 'time' | 'tempF', value: string | number) => {
     setEditablePoints((prev) => {
@@ -280,7 +262,7 @@ export function AICurveWizard({ open, onClose, onApply }: AICurveWizardProps) {
             )}
             {step === 3 && (
               <>
-                <Button icon={Save} onClick={handleSaveTemplate}>Save template</Button>
+                <Button icon={Save} onClick={() => void handleSaveTemplate()} disabled={isSaving}>Save to saved curves</Button>
                 <Button variant="primary" onClick={handleApply} disabled={editablePoints.length < 3}>
                   Use curve
                 </Button>
@@ -312,9 +294,6 @@ export function AICurveWizard({ open, onClose, onApply }: AICurveWizardProps) {
         <StepDescribe
           preferences={preferences}
           onPreferencesChange={setPreferences}
-          templates={savedTemplates}
-          onLoadTemplate={handleLoadTemplate}
-          onDeleteTemplate={handleDeleteTemplate}
         />
       )}
       {step === 1 && (
@@ -343,6 +322,7 @@ export function AICurveWizard({ open, onClose, onApply }: AICurveWizardProps) {
           onRemovePoint={removePoint}
         />
       )}
+      {step === 3 && templateError && <Alert tone="danger">{`Could not save the curve: ${templateError}`}</Alert>}
     </Modal>
   )
 }
@@ -352,15 +332,9 @@ const FIELD = 'w-full rounded-ctl border border-line-2 bg-field px-3 py-[9px] te
 function StepDescribe({
   preferences,
   onPreferencesChange,
-  templates,
-  onLoadTemplate,
-  onDeleteTemplate,
 }: {
   preferences: string
   onPreferencesChange: (v: string) => void
-  templates: CurveTemplate[]
-  onLoadTemplate: (t: CurveTemplate) => void
-  onDeleteTemplate: (name: string) => void
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -392,24 +366,6 @@ function StepDescribe({
         ))}
       </div>
 
-      {templates.length > 0 && (
-        <div className="flex flex-col gap-1.5">
-          <SectionLabel>Saved curves</SectionLabel>
-          {templates.map(t => (
-            <div key={t.name} className="flex items-center gap-2 rounded-ctl border border-line-2 px-3 py-1.5">
-              <button
-                type="button"
-                onClick={() => onLoadTemplate(t)}
-                className="flex flex-1 cursor-pointer items-center gap-2 border-0 bg-transparent p-0 text-left"
-              >
-                <span className="flex-1 text-[13px] text-fg">{t.name}</span>
-                <span className="font-mono text-[11px] text-fg-2">{`${t.bedtime} → ${t.wake}`}</span>
-              </button>
-              <GhostIcon icon={X} size={14} label={`Delete ${t.name}`} onClick={() => onDeleteTemplate(t.name)} />
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   )
 }

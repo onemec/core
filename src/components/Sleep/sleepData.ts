@@ -8,6 +8,7 @@ import {
   type SleepStage,
   type StageDistribution,
 } from '@/src/lib/sleep-stages'
+import { DEFAULT_STAGE_RULESET, type StageRuleset } from '@/src/lib/sleep-stage-rules'
 
 /* Pure data shaping for the Sleep screen (night grouping, formatting,
    hypnogram geometry, calendar math). Kept free of React so it is unit
@@ -209,6 +210,11 @@ export interface NightSummary {
 /**
  * Build `days` consecutive nights starting at `from`, classifying each
  * night's stages client-side from the range's vitals + movement.
+ *
+ * `ruleset` null = the side's classifier is unknown (still loading or failed
+ * to load), and `calibrationQuality` null = the side's calibration is unknown:
+ * in either case vitals averages are kept but no stages or quality are
+ * computed, rather than classifying with the defaults or at full quality.
  */
 export function buildNights(
   from: Date,
@@ -216,6 +222,8 @@ export function buildNights(
   records: SleepRecordRow[],
   vitals: VitalsRow[] = [],
   movement: MovementRow[] = [],
+  calibrationQuality: number | null = 1.0,
+  ruleset: StageRuleset | null = DEFAULT_STAGE_RULESET,
 ): NightSummary[] {
   const byNight = groupByNight(records)
   const sortedVitals = [...vitals].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
@@ -240,11 +248,13 @@ export function buildNights(
       }
       const nv = sortedVitals.filter(v => inWindow(v.timestamp)).map(v => ({ ...v, timestamp: new Date(v.timestamp) }))
       if (nv.length > 0) {
-        const nm = movement.filter(m => inWindow(m.timestamp)).map(m => ({ ...m, timestamp: new Date(m.timestamp) }))
-        const epochs = classifySleepStages(nv, nm)
-        if (epochs.length > 0) {
-          distribution = calculateDistribution(epochs)
-          quality = calculateQualityScore(distribution)
+        if (ruleset !== null && calibrationQuality !== null) {
+          const nm = movement.filter(m => inWindow(m.timestamp)).map(m => ({ ...m, timestamp: new Date(m.timestamp) }))
+          const epochs = classifySleepStages(nv, nm, calibrationQuality, ruleset)
+          if (epochs.length > 0) {
+            distribution = calculateDistribution(epochs)
+            quality = calculateQualityScore(distribution, calibrationQuality)
+          }
         }
         hr = average(nv.map(v => v.heartRate))
         hrv = average(nv.map(v => v.hrv))

@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { trpc } from '@/src/utils/trpc'
 import { Card, CardHeader, InlineError, SelectValue, SettingRow, StatusDot, TextField, Toggle } from '@/src/components/ds'
-import { SectionColumns } from './SettingsLayout'
+import { SectionColumns, SideTabs, TimeField } from './SettingsLayout'
 
 interface SideData {
   side: 'left' | 'right'
@@ -14,6 +14,10 @@ interface SideData {
   alwaysOn: boolean
   autoOffEnabled: boolean
   autoOffMinutes: number
+  autoOnEnabled: boolean
+  autoOnMinutes: number
+  autoOnStart: string
+  autoOnEnd: string
 }
 
 interface SideSettingsFormProps {
@@ -26,9 +30,12 @@ interface SideSettingsFormProps {
    * it would do nothing (the watcher stands down on unsensable presence).
    */
   presenceAvailable: boolean | null
+  /** When set, each card shows a Left/Right tab strip that calls this. */
+  onSideChange?: (side: 'left' | 'right') => void
 }
 
 const AUTO_OFF_DURATION_OPTIONS = [5, 10, 15, 30, 45, 60, 90, 120] as const
+const AUTO_ON_DWELL_OPTIONS = [1, 2, 3, 5, 10, 15, 30] as const
 
 function localDateTime(iso: string): string {
   const date = new Date(iso)
@@ -41,9 +48,10 @@ function formatMinutes(mins: number): string {
 }
 
 /**
- * Per-side settings: profile name, away mode, always on, and auto-off.
+ * Per-side settings: profile name, away mode, always on, auto-off, and the
+ * experimental presence auto-on.
  */
-export function SideSettingsForm({ side, sideData, presenceAvailable }: SideSettingsFormProps) {
+export function SideSettingsForm({ side, sideData, presenceAvailable, onSideChange }: SideSettingsFormProps) {
   const d = sideData ?? {
     side,
     name: side === 'left' ? 'Left' : 'Right',
@@ -51,25 +59,38 @@ export function SideSettingsForm({ side, sideData, presenceAvailable }: SideSett
     alwaysOn: false,
     autoOffEnabled: false,
     autoOffMinutes: 30,
+    autoOnEnabled: false,
+    autoOnMinutes: 5,
+    autoOnStart: '20:00',
+    autoOnEnd: '08:00',
   }
 
   // key forces remount when server data changes, replacing the useEffect sync pattern
   return (
     <SideCards
-      key={`${d.side}-${d.name}-${d.awayMode}-${d.awayStart}-${d.awayReturn}-${d.alwaysOn}-${d.autoOffEnabled}-${d.autoOffMinutes}`}
+      key={`${d.side}-${d.name}-${d.awayMode}-${d.awayStart}-${d.awayReturn}-${d.alwaysOn}-${d.autoOffEnabled}-${d.autoOffMinutes}-${d.autoOnEnabled}-${d.autoOnMinutes}-${d.autoOnStart}-${d.autoOnEnd}`}
       data={d}
       presenceAvailable={presenceAvailable}
+      onSideChange={onSideChange}
     />
   )
 }
 
-function SideCards({ data, presenceAvailable }: { data: SideData, presenceAvailable: boolean | null }) {
+function SideCards({ data, presenceAvailable, onSideChange }: {
+  data: SideData
+  presenceAvailable: boolean | null
+  onSideChange?: (side: 'left' | 'right') => void
+}) {
   const utils = trpc.useUtils()
   const [name, setName] = useState(data.name)
   const [awayMode, setAwayMode] = useState(data.awayMode)
   const [alwaysOn, setAlwaysOn] = useState(data.alwaysOn)
   const [autoOffEnabled, setAutoOffEnabled] = useState(data.autoOffEnabled)
   const [autoOffMinutes, setAutoOffMinutes] = useState(data.autoOffMinutes)
+  const [autoOnEnabled, setAutoOnEnabled] = useState(data.autoOnEnabled)
+  const [autoOnMinutes, setAutoOnMinutes] = useState(data.autoOnMinutes)
+  const [autoOnStart, setAutoOnStart] = useState(data.autoOnStart)
+  const [autoOnEnd, setAutoOnEnd] = useState(data.autoOnEnd)
 
   const mutation = trpc.settings.updateSide.useMutation({
     onSuccess: () => utils.settings.getAll.invalidate(),
@@ -82,6 +103,7 @@ function SideCards({ data, presenceAvailable }: { data: SideData, presenceAvaila
   // would block the toggle before the occupancy query resolves.
   const presenceUnavailable = presenceAvailable === false
   const autoOffToggleDisabled = isPending || (presenceUnavailable && !autoOffEnabled)
+  const autoOnToggleDisabled = isPending || (presenceUnavailable && !autoOnEnabled)
 
   function handleNameBlur() {
     const trimmed = name.trim()
@@ -137,9 +159,30 @@ function SideCards({ data, presenceAvailable }: { data: SideData, presenceAvaila
     mutation.mutate({ side: data.side, autoOffMinutes: minutes })
   }
 
+  function handleAutoOnToggle() {
+    const newVal = !autoOnEnabled
+    setAutoOnEnabled(newVal)
+    mutation.mutate({ side: data.side, autoOnEnabled: newVal })
+  }
+
+  function handleAutoOnMinutesChange(minutes: number) {
+    setAutoOnMinutes(minutes)
+    mutation.mutate({ side: data.side, autoOnMinutes: minutes })
+  }
+
+  function handleAutoOnWindowChange(field: 'autoOnStart' | 'autoOnEnd', value: string) {
+    if (!/^\d{2}:\d{2}$/.test(value)) return // the native picker emits '' mid-edit
+    if (field === 'autoOnStart') setAutoOnStart(value)
+    else setAutoOnEnd(value)
+    mutation.mutate({ side: data.side, [field]: value })
+  }
+
   const minuteOptions = (AUTO_OFF_DURATION_OPTIONS as readonly number[]).includes(autoOffMinutes)
     ? AUTO_OFF_DURATION_OPTIONS
     : [...AUTO_OFF_DURATION_OPTIONS, autoOffMinutes].sort((a, b) => a - b)
+  const dwellOptions = (AUTO_ON_DWELL_OPTIONS as readonly number[]).includes(autoOnMinutes)
+    ? AUTO_ON_DWELL_OPTIONS
+    : [...AUTO_ON_DWELL_OPTIONS, autoOnMinutes].sort((a, b) => a - b)
 
   const presence = presenceAvailable === null
     ? <StatusDot tone="muted" label="Checking presence" />
@@ -147,9 +190,12 @@ function SideCards({ data, presenceAvailable }: { data: SideData, presenceAvaila
       ? <StatusDot tone="ok" label="Presence available" />
       : <StatusDot tone="warn" label="Presence unavailable" />
 
+  const tabs = (label: string) => onSideChange && <SideTabs side={data.side} onChange={onSideChange} label={label} />
+
   const left = (
     <>
       <Card>
+        {tabs('Profile')}
         <CardHeader title="Profile" />
         <div className="grid grid-cols-2 gap-3">
           <label className="flex min-w-0 flex-col gap-1.5">
@@ -171,6 +217,7 @@ function SideCards({ data, presenceAvailable }: { data: SideData, presenceAvaila
       </Card>
 
       <Card>
+        {tabs('Away mode')}
         <CardHeader title="Away mode" subtitle="Temporarily pause this sleeper’s tracking and alarms. Their profile and schedules are saved. The other-zone preference controls temperature while one sleeper is home." />
         <SettingRow label="Away">
           <Toggle
@@ -201,6 +248,7 @@ function SideCards({ data, presenceAvailable }: { data: SideData, presenceAvaila
   const right = (
     <>
       <Card>
+        {tabs('Auto-off')}
         <CardHeader title="Auto-off" subtitle="Turns this side off after you leave the bed" right={presence} />
         <SettingRow label="Turn off after">
           <SelectValue
@@ -233,6 +281,61 @@ function SideCards({ data, presenceAvailable }: { data: SideData, presenceAvaila
             label={`Toggle always on for ${sideLabel} side`}
           />
         </SettingRow>
+      </Card>
+
+      <Card>
+        {tabs('Auto-on')}
+        <CardHeader
+          title="Auto-on"
+          subtitle="Turns this side on once you’ve settled into bed. Uses your schedule’s temperature, or the last one set. Pets and other light loads don’t count."
+          right={(
+            <span
+              title="Experimental: person-vs-pet detection is new. If the bed turns on when it shouldn’t, turn this off and tell us."
+              className="rounded border border-[#3a3222] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.08em] text-[#e0b45a]"
+            >
+              Experimental
+            </span>
+          )}
+        />
+        <SettingRow label="Turn on after">
+          <SelectValue
+            label="Auto-on after"
+            value={autoOnMinutes}
+            options={dwellOptions.map(m => ({ value: m, label: formatMinutes(m) }))}
+            onChange={handleAutoOnMinutesChange}
+            disabled={isPending || !autoOnEnabled}
+          />
+          <Toggle
+            on={autoOnEnabled}
+            onChange={handleAutoOnToggle}
+            disabled={autoOnToggleDisabled}
+            label={`Toggle auto-on for ${sideLabel} side`}
+          />
+        </SettingRow>
+        <SettingRow label="Only between" sub="Local time. Set both the same for any time.">
+          <div className="flex items-center gap-2">
+            <TimeField
+              label={`Auto-on window start for ${sideLabel} side`}
+              value={autoOnStart}
+              onChange={v => handleAutoOnWindowChange('autoOnStart', v)}
+              disabled={isPending || !autoOnEnabled}
+            />
+            <span className="text-xs text-fg-3">to</span>
+            <TimeField
+              label={`Auto-on window end for ${sideLabel} side`}
+              value={autoOnEnd}
+              onChange={v => handleAutoOnWindowChange('autoOnEnd', v)}
+              disabled={isPending || !autoOnEnabled}
+            />
+          </div>
+        </SettingRow>
+        {presenceUnavailable && (
+          <p className="text-xs leading-[1.4] text-warn">
+            {autoOnEnabled
+              ? 'Presence sensing is unavailable, so auto-on is currently inactive. Calibrate the capacitance sensor for this side to restore it.'
+              : 'Auto-on needs presence sensing. Calibrate the capacitance sensor for this side to enable it.'}
+          </p>
+        )}
       </Card>
       {mutation.error && <InlineError>{mutation.error.message}</InlineError>}
     </>

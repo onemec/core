@@ -20,9 +20,8 @@ export interface CurveTemplate extends GeneratedCurve {
 
 // ─── Prompt Generation ───────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are a board-certified sleep medicine physician with expertise in thermoregulation and circadian biology. Based on the user's sleep preferences below, generate an optimal nightly temperature curve for a water-based bed temperature control system.
-
-**System capabilities:**
+/** Hardware limits and sleep science a curve designer needs; also used by the MCP design_sleep_curve prompt. */
+export const CURVE_DESIGN_GUIDANCE = `**System capabilities:**
 - Water temperature range: 55°F to 110°F
 - Neutral (body-neutral) temperature: ~82.5°F
 - Typical comfortable sleep range: 65°F to 90°F
@@ -36,6 +35,10 @@ const SYSTEM_PROMPT = `You are a board-certified sleep medicine physician with e
 
 **Individual variation guidance:**
 Consider the user's thermal phenotype (hot sleeper vs cold sleeper), chronotype (early bird vs night owl), and any mentioned conditions (e.g., menopause, chronic pain, post-exercise recovery). Adjust the curve aggressiveness and temperature floor/ceiling accordingly.`
+
+const SYSTEM_PROMPT = `You are a board-certified sleep medicine physician with expertise in thermoregulation and circadian biology. Based on the user's sleep preferences below, generate an optimal nightly temperature curve for a water-based bed temperature control system.
+
+${CURVE_DESIGN_GUIDANCE}`
 
 export function generatePrompt(preferences: string): string {
   return `${SYSTEM_PROMPT}
@@ -151,7 +154,9 @@ export function parseAIResponse(raw: string): ParseResult {
   }
 }
 
-// ─── Template Persistence (localStorage) ─────────────────────────────
+// ─── Legacy browser templates ────────────────────────────────────────
+// Saved curves now live on the pod (curveTemplates router). Older versions
+// kept them in localStorage; useCurveTemplates moves them over once.
 
 const STORAGE_KEY = 'sleepypod_curve_templates'
 
@@ -166,24 +171,12 @@ export function loadTemplates(): CurveTemplate[] {
   }
 }
 
-export function saveTemplate(curve: GeneratedCurve): CurveTemplate {
-  const templates = loadTemplates()
-  const template: CurveTemplate = { ...curve, createdAt: Date.now() }
-
-  // Replace if same name exists, otherwise prepend
-  const idx = templates.findIndex(t => t.name === curve.name)
-  if (idx >= 0) {
-    templates[idx] = template
+export function removeLocalTemplates(names: string[]): void {
+  const drop = new Set(names)
+  const remaining = loadTemplates().filter(t => !drop.has(t.name))
+  try {
+    if (remaining.length === 0) localStorage.removeItem(STORAGE_KEY)
+    else localStorage.setItem(STORAGE_KEY, JSON.stringify(remaining))
   }
-  else {
-    templates.unshift(template)
-  }
-
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(templates))
-  return template
-}
-
-export function deleteTemplate(name: string): void {
-  const templates = loadTemplates().filter(t => t.name !== name)
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(templates))
+  catch { /* storage unavailable; the pod copy is what the UI reads */ }
 }

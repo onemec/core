@@ -235,12 +235,44 @@ const expectedTables: Record<string, TableSpec> = {
       { name: 'always_on', notNull: true, default: false },
       { name: 'auto_off_enabled', notNull: true, default: false },
       { name: 'auto_off_minutes', notNull: true, default: 30 },
+      { name: 'auto_on_enabled', notNull: true, default: false },
+      { name: 'auto_on_minutes', notNull: true, default: 5 },
+      { name: 'auto_on_start', notNull: true, default: '20:00' },
+      { name: 'auto_on_end', notNull: true, default: '08:00' },
       { name: 'away_start', notNull: false, default: undefined },
       { name: 'away_return', notNull: false, default: undefined },
+      { name: 'stage_classifier', notNull: false, default: undefined },
       { name: 'created_at', notNull: true, default: 'sql' },
       { name: 'updated_at', notNull: true, default: 'sql' },
     ],
     indexes: [],
+  },
+  sideStageModels: {
+    name: 'side_stage_models',
+    columns: [
+      { name: 'side', notNull: true, default: undefined },
+      { name: 'model', notNull: true, default: undefined },
+      { name: 'version', notNull: true, default: undefined },
+      { name: 'uploaded_at', notNull: true, default: undefined },
+      { name: 'active', notNull: true, default: false },
+    ],
+    indexes: [],
+  },
+  stageClassifierChanges: {
+    name: 'stage_classifier_changes',
+    columns: [
+      { name: 'id', notNull: true, default: 'fn' },
+      { name: 'side', notNull: true, default: undefined },
+      { name: 'changed_at', notNull: true, default: 'sql' },
+      { name: 'before', notNull: false, default: undefined },
+      { name: 'after', notNull: false, default: undefined },
+      { name: 'summary', notNull: true, default: undefined },
+      { name: 'agreement_before', notNull: false, default: undefined },
+      { name: 'agreement_after', notNull: false, default: undefined },
+    ],
+    indexes: [
+      { name: 'idx_stage_classifier_changes_side_changed_at', unique: false, columns: ['side', 'changed_at'] },
+    ],
   },
   tapGestures: {
     name: 'tap_gestures',
@@ -277,6 +309,19 @@ const expectedTables: Record<string, TableSpec> = {
       { name: 'idx_temp_schedules_side_day_time', unique: false, columns: ['side', 'day_of_week', 'time'] },
     ],
   },
+  scheduleNotes: {
+    name: 'schedule_notes',
+    columns: [
+      { name: 'id', notNull: true, default: 'fn' },
+      { name: 'side', notNull: true, default: undefined },
+      { name: 'day_of_week', notNull: true, default: undefined },
+      { name: 'notes', notNull: true, default: undefined },
+      { name: 'updated_at', notNull: true, default: 'sql' },
+    ],
+    indexes: [
+      { name: 'idx_schedule_notes_side_day', unique: true, columns: ['side', 'day_of_week'] },
+    ],
+  },
   powerSchedules: {
     name: 'power_schedules',
     columns: [
@@ -307,6 +352,8 @@ const expectedTables: Record<string, TableSpec> = {
       { name: 'duration', notNull: true, default: undefined },
       { name: 'alarm_temperature', notNull: true, default: undefined },
       { name: 'wake_window', notNull: true, default: 0 },
+      { name: 'snooze_duration', notNull: true, default: 300 },
+      { name: 'snooze_taper', notNull: true, default: 0 },
       { name: 'enabled', notNull: true, default: true },
       { name: 'created_at', notNull: true, default: 'sql' },
       { name: 'updated_at', notNull: true, default: 'sql' },
@@ -340,6 +387,26 @@ const expectedTables: Record<string, TableSpec> = {
       { name: 'last_checked', notNull: true, default: 'sql' },
     ],
     indexes: [],
+  },
+  curveTemplates: {
+    name: 'curve_templates',
+    columns: [
+      { name: 'id', notNull: true, default: 'fn' },
+      { name: 'name', notNull: true, default: undefined },
+      { name: 'bedtime', notNull: true, default: undefined },
+      { name: 'wake', notNull: true, default: undefined },
+      { name: 'points', notNull: true, default: undefined },
+      { name: 'reasoning', notNull: true, default: '' },
+      { name: 'end_action', notNull: true, default: 'turn_off' },
+      { name: 'left_days', notNull: true, default: 'sql' },
+      { name: 'right_days', notNull: true, default: 'sql' },
+      { name: 'active', notNull: true, default: false },
+      { name: 'created_at', notNull: true, default: 'sql' },
+      { name: 'updated_at', notNull: true, default: 'sql' },
+    ],
+    indexes: [
+      { name: 'idx_curve_templates_name', unique: true, columns: ['name'] },
+    ],
   },
   runOnceSessions: {
     name: 'run_once_sessions',
@@ -414,7 +481,12 @@ describe('db schema definitions', () => {
       })
       .map(([k]) => k)
       .sort()
-    expect(actualTableExports).toEqual(Object.keys(expectedTables).sort())
+    // New biometric tables are pinned by the exhaustive snapshot below and
+    // exercised against real migrations by the profile repository tests.
+    expect(actualTableExports).toEqual([...Object.keys(expectedTables),
+      'biometricProfileRevisions', 'biometricProfileBindings',
+      'biometricActivationEvents', 'biometricConfigOutbox', 'stageModelLibrary',
+    ].sort())
   })
 })
 

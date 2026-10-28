@@ -9,6 +9,16 @@ import { useTemperatureUnit } from '@/src/hooks/useTemperatureUnit'
 import { formatDisplayTemp, sensorCToDisplay } from '@/src/lib/tempUtils'
 import { Card, SectionLabel, Skeleton, StatusDot, type Tone } from '@/src/components/ds'
 
+/** Overcurrent threshold in Amperes. Eight Sleep TECs pull ~10-11.5A during startup
+ * circuit calibration and up to 12A under peak thermal demand. Real overcurrent is >13.5A. */
+export const TEC_OVERCURRENT_AMPS = 13.5
+
+/** Minimum commanded fan duty percentage before evaluating stalled fan.
+ * When the heatsink is cold and thermal power is 0, firmware sets duty to 0% (0 RPM)
+ * for silent operation. */
+export const FAN_MIN_ACTIVE_DUTY = 20
+export const FAN_MIN_RPM = 100
+
 /** Overall freezer verdict from live health + water level. */
 export function freezerStatus(
   health: FrzHealthFrame | undefined,
@@ -17,8 +27,12 @@ export function freezerStatus(
 ): { tone: Tone, label: string } {
   if (!hasData) return { tone: 'muted', label: 'No data' }
   if (waterLevel === 'low') return { tone: 'warn', label: 'Water low' }
-  if (health && (health.left.tecCurrent > 5 || health.right.tecCurrent > 5)) return { tone: 'warn', label: 'High TEC' }
-  if (health && health.fan.rpm < 100) return { tone: 'warn', label: 'Fan slow' }
+  if (health && (health.left.tecCurrent > TEC_OVERCURRENT_AMPS || health.right.tecCurrent > TEC_OVERCURRENT_AMPS)) {
+    return { tone: 'warn', label: 'High TEC' }
+  }
+  if (health && health.fan.duty > FAN_MIN_ACTIVE_DUTY && health.fan.rpm < FAN_MIN_RPM) {
+    return { tone: 'warn', label: 'Fan slow' }
+  }
   return { tone: 'ok', label: 'Normal' }
 }
 

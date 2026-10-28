@@ -52,6 +52,10 @@ const sideSettingsSchema = z.object({
   alwaysOn: z.boolean(),
   autoOffEnabled: z.boolean(),
   autoOffMinutes: z.number(),
+  autoOnEnabled: z.boolean(),
+  autoOnMinutes: z.number(),
+  autoOnStart: z.string(),
+  autoOnEnd: z.string(),
   awayStart: z.string().nullable().optional(),
   awayReturn: z.string().nullable().optional(),
   createdAt: timestampSchema,
@@ -87,6 +91,7 @@ import { getJobManager } from '@/src/scheduler'
 import { updateAutomationTimezone } from '@/src/automation/instance'
 import { startKeepalive, stopKeepalive } from '@/src/services/temperatureKeepalive'
 import { restartAutoOffTimers } from '@/src/services/autoOffWatcher'
+import { restartAutoOnWatcher } from '@/src/services/autoOnWatcher'
 import { invalidateGuardSettingsCache, standDown as standDownPumpStallGuard } from '@/src/hardware/pumpStallGuard'
 
 const REBOOT_KEYS = ['rebootDaily', 'rebootTime'] as const
@@ -195,8 +200,8 @@ export const settingsRouter = router({
             updatedAt: new Date(),
           },
           sides: {
-            left: sides.find(s => s.side === 'left') ?? { side: 'left' as const, name: 'Left', alwaysOn: false, awayMode: false, autoOffEnabled: false, autoOffMinutes: 30, createdAt: new Date(), updatedAt: new Date() },
-            right: sides.find(s => s.side === 'right') ?? { side: 'right' as const, name: 'Right', alwaysOn: false, awayMode: false, autoOffEnabled: false, autoOffMinutes: 30, createdAt: new Date(), updatedAt: new Date() },
+            left: sides.find(s => s.side === 'left') ?? { side: 'left' as const, name: 'Left', alwaysOn: false, awayMode: false, autoOffEnabled: false, autoOffMinutes: 30, autoOnEnabled: false, autoOnMinutes: 5, autoOnStart: '20:00', autoOnEnd: '08:00', createdAt: new Date(), updatedAt: new Date() },
+            right: sides.find(s => s.side === 'right') ?? { side: 'right' as const, name: 'Right', alwaysOn: false, awayMode: false, autoOffEnabled: false, autoOffMinutes: 30, autoOnEnabled: false, autoOnMinutes: 5, autoOnStart: '20:00', autoOnEnd: '08:00', createdAt: new Date(), updatedAt: new Date() },
           },
           gestures: {
             left: gestures.filter(g => g.side === 'left'),
@@ -477,6 +482,10 @@ export const settingsRouter = router({
           awayMode: z.boolean().optional(),
           autoOffEnabled: z.boolean().optional(),
           autoOffMinutes: z.number().int().min(5).max(120).optional(),
+          autoOnEnabled: z.boolean().optional(),
+          autoOnMinutes: z.number().int().min(1).max(60).optional(),
+          autoOnStart: timeStringSchema.optional(),
+          autoOnEnd: timeStringSchema.optional(),
           awayStart: isoDatetimeSchema.nullable().optional(),
           awayReturn: isoDatetimeSchema.nullable().optional(),
         })
@@ -489,6 +498,10 @@ export const settingsRouter = router({
       alwaysOn: z.boolean(),
       autoOffEnabled: z.boolean(),
       autoOffMinutes: z.number(),
+      autoOnEnabled: z.boolean(),
+      autoOnMinutes: z.number(),
+      autoOnStart: z.string(),
+      autoOnEnd: z.string(),
       awayStart: z.string().nullable(),
       awayReturn: z.string().nullable(),
       createdAt: z.date(),
@@ -604,6 +617,17 @@ export const settingsRouter = router({
           }
         }
 
+        // Re-evaluate auto-on so a changed dwell/window/enable or an away
+        // toggle takes effect without waiting for the next 30s poll.
+        if ('autoOnEnabled' in input || 'autoOnMinutes' in input || 'autoOnStart' in input || 'autoOnEnd' in input || 'awayMode' in input) {
+          try {
+            restartAutoOnWatcher()
+          }
+          catch (e) {
+            console.error('Auto-on watcher restart failed:', e)
+          }
+        }
+
         return updated
       }
       catch (error) {
@@ -701,6 +725,9 @@ export const settingsRouter = router({
             actionType: z.literal('temperature'),
             temperatureChange: z.enum(['increment', 'decrement']),
             temperatureAmount: z.number().int().min(0).max(10),
+            // What the tap does while an alarm is ringing (any action type).
+            alarmBehavior: z.enum(['snooze', 'dismiss']).optional(),
+            alarmSnoozeDuration: z.number().int().min(60).max(600).optional(),
           })
           .strict(),
         z
@@ -716,6 +743,16 @@ export const settingsRouter = router({
       ])
     )
     .mutation(async ({ input }) => {
+      // Write the whole row: a field the call leaves out is cleared, so a tap
+      // switched between action types keeps nothing from its old action.
+      const row = {
+        temperatureChange: null,
+        temperatureAmount: null,
+        alarmBehavior: null,
+        alarmSnoozeDuration: null,
+        alarmInactiveBehavior: null,
+        ...input,
+      }
       try {
         const result = db.transaction((tx) => {
           // Check if gesture already exists
@@ -736,7 +773,7 @@ export const settingsRouter = router({
             const [updated] = tx
               .update(tapGestures)
               .set({
-                ...input,
+                ...row,
                 updatedAt: new Date(),
               })
               .where(eq(tapGestures.id, existing[0].id))
@@ -756,9 +793,7 @@ export const settingsRouter = router({
             // Create new
             const [created] = tx
               .insert(tapGestures)
-              .values({
-                ...input,
-              })
+              .values(row)
               .returning()
               .all()
 

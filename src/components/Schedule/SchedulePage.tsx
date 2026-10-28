@@ -12,6 +12,8 @@ import { useScheduleActive } from '@/src/hooks/useScheduleActive'
 import { useSide } from '@/src/providers/SideProvider'
 import type { Side, SideSelection } from '@/src/providers/SideProvider'
 import { useSideNames } from '@/src/hooks/useSideNames'
+import { useCurveTemplates, type SavedCurve } from '@/src/hooks/useCurveTemplates'
+import { activeCurveOn, type CurveDays, type DayMove, hasDays, planClaims } from '@/src/lib/scheduleLibrary'
 import { useTemperatureUnit } from '@/src/hooks/useTemperatureUnit'
 import { formatSetpointF } from '@/src/lib/tempUtils'
 import { groupDaysBySharedCurve } from '@/src/lib/scheduleGrouping'
@@ -23,6 +25,7 @@ import { nextSetPoint, type TempRow } from './bothNight'
 import { CurveCard } from './CurveCard'
 import { useNowMinute } from './CurveChart'
 import { CurveEditor } from './CurveEditor'
+import { curveDaysLabel, describeMoves, SavedCurveCard, templateSetPoints } from './SavedCurveCard'
 import { ConfirmDialog } from './ConfirmDialog'
 import { ScheduleToggle } from './ScheduleToggle'
 import { SchedulerConfirmation } from './SchedulerConfirmation'
@@ -33,10 +36,20 @@ interface EditingCurve {
   days: DayOfWeek[]
   endAction?: 'turn_off' | 'maintain'
   setPoints: Array<{ time: string, temperature: number }>
+  notes?: string
+  /** Set when editing a curve in the library. */
+  id?: number
+  name?: string
+  active?: boolean
+  curveDays?: CurveDays
 }
 
 interface SchedulePageProps {
-  /** /schedule/<curve>: 'new' or a curve's days ('mon-tue-wed'); opens the editor. */
+  /**
+   * /schedule/<curve>: 'new', a library curve's id ('12'), or the days of a
+   * schedule ('mon-tue-wed', which opens the library curve running them);
+   * opens the editor.
+   */
   curve?: string
   /** ?side= on a curve link: the side (or both) the curve belongs to. */
   curveSide?: SideSelection
@@ -72,6 +85,9 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
   const { nextEvent } = useScheduleActive()
   const { leftName, rightName } = useSideNames()
   const { data, isLoading, error } = trpc.schedules.getAll.useQuery({ side })
+  const { data: notesData, isLoading: notesLoading } = trpc.schedules.getNotes.useQuery({ side })
+  // A curve's days normally share one note; show the first one set.
+  const notesFor = (days: DayOfWeek[]) => days.map(d => notesData?.find(n => n.dayOfWeek === d)?.notes).find(Boolean)
   const both = selectedSide === 'both'
   const otherSide: Side = side === 'left' ? 'right' : 'left'
   const other = trpc.schedules.getAll.useQuery({ side: otherSide }, { enabled: both })
@@ -79,6 +95,10 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
   const bothTemps = { [side]: data?.temperature, [otherSide]: other.data?.temperature } as Record<Side, TempRow[] | undefined>
   const names: Record<Side, string> = { left: leftName, right: rightName }
   const nowMinute = useNowMinute()
+  const saved = useCurveTemplates()
+  const [pendingSavedDelete, setPendingSavedDelete] = useState<SavedCurve | null>(null)
+  const [pendingToggle, setPendingToggle] = useState<{ curve: SavedCurve, moves: DayMove[] } | null>(null)
+  const [libraryError, setLibraryError] = useState<string | null>(null)
 
   // Last night's measured bed temperature for the featured chart.
   const now = nowMinute === null ? null : new Date(nowMinute * 60_000)
@@ -142,7 +162,16 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
   const featured = visibleGroups.find(g => g.key === activeCurveKey)
     ?? visibleGroups.find(g => g.setPoints.length > 0 && !g.allDisabled)
     ?? null
-  const others = visibleGroups.filter(g => g !== featured)
+  // The library curve running a schedule's days on a side, if any.
+  const ownerOf = (s: Side, group: ScheduleGroup) => activeCurveOn(saved.templates, s, group.days[0])
+  const featuredOwner = featured ? ownerOf(side, featured) : undefined
+  // Schedules not in the library (rows written one at a time through the API).
+  const others = visibleGroups.filter(g => g !== featured && !ownerOf(side, g))
+  const viewSides: Side[] = both ? ['left', 'right'] : [side]
+  // Library curves for this view: ones with days on a shown side, or no days at all.
+  const libraryCurves = saved.templates
+    .filter(t => !hasDays(t.days) || viewSides.some(s => t.days[s].length > 0))
+    .sort((a, b) => Number(b.active) - Number(a.active))
 
   const curveHref = useCallback((slug: string, linkSide: SideSelection | null, from?: 'both') => {
     const params = new URLSearchParams()
@@ -154,12 +183,48 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
 
   const handleEdit = useCallback((group: ScheduleGroup) => {
     setSelectedDays(new Set(group.days))
-    router.push(curveHref(curveSlug(group.days), singleScheduleSide ? null : side))
-  }, [router, curveHref, setSelectedDays, singleScheduleSide, side])
+    const owner = activeCurveOn(saved.templates, side, group.days[0])
+    router.push(curveHref(owner ? String(owner.id) : curveSlug(group.days), singleScheduleSide ? null : side))
+  }, [router, curveHref, setSelectedDays, singleScheduleSide, side, saved.templates])
 
   const handleCreate = useCallback(() => {
     router.push(curveHref('new', singleScheduleSide ? null : selectedSide))
   }, [router, curveHref, singleScheduleSide, selectedSide])
+
+  // A curve running one side only opens on that side, so saving it from the Both view can't copy it to the other.
+  const openCurve = useCallback((t: SavedCurve) => {
+    const only = t.days.left.length > 0 && t.days.right.length === 0
+      ? 'left'
+      : t.days.right.length > 0 && t.days.left.length === 0
+        ? 'right'
+        : selectedSide
+    router.push(curveHref(String(t.id), singleScheduleSide ? null : only, both && only !== 'both' ? 'both' : undefined))
+  }, [router, curveHref, singleScheduleSide, selectedSide, both])
+
+  const runToggle = async (t: SavedCurve, next: boolean) => {
+    setLibraryError(null)
+    try {
+      await saved.setActive(t.id, next)
+    }
+    catch (err) {
+      setLibraryError(err instanceof Error ? err.message : `Failed to turn ${next ? 'on' : 'off'} ${t.name}`)
+    }
+    finally {
+      setPendingToggle(null)
+    }
+  }
+
+  // Turning a curve on moves days other active curves run on; ask first. A
+  // curve without days opens in the editor to pick them.
+  const toggleCurve = (t: SavedCurve, next: boolean) => {
+    if (next && !hasDays(t.days)) {
+      openCurve(t)
+      return
+    }
+    const moves = next ? planClaims(saved.templates, t.id, t.days, true).moves : []
+    if (moves.length > 0) setPendingToggle({ curve: t, moves })
+    else void runToggle(t, next)
+  }
 
   const handleDelete = useCallback((group: ScheduleGroup) => {
     setPendingDelete({ days: group.days, label: deleteLabel(group.days) })
@@ -177,7 +242,8 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
   }
 
   const editFor = (s: Side, group: ScheduleGroup) => {
-    router.push(curveHref(curveSlug(group.days), s, 'both'))
+    const owner = ownerOf(s, group)
+    router.push(curveHref(owner ? String(owner.id) : curveSlug(group.days), s, 'both'))
   }
 
   const deleteFor = (s: Side, group: ScheduleGroup) => {
@@ -188,16 +254,32 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
 
   if (curve) {
     const closeEditor = () => router.push(schedulePath)
-    const linkedDays = curve === 'new' ? null : parseCurveSlug(curve)
+    const curveId = /^\d+$/.test(curve) ? Number(curve) : null
+    const linkedDays = curve === 'new' || curveId !== null ? null : parseCurveSlug(curve)
     const group = linkedDays ? visibleGroups.find(g => sameDays(g.days, linkedDays)) : undefined
+    const owned = curveId !== null
+      ? saved.templates.find(t => t.id === curveId)
+      : linkedDays?.[0] ? activeCurveOn(saved.templates, side, linkedDays[0]) : undefined
     const sideReady = !wantSide || chosenSide === wantSide
-    if (!sideReady || (curve === 'new' ? settingsLoading : isLoading && !data)) {
+    // The editor keeps its first notes, so an existing curve waits for them; saving an unloaded note would clear it.
+    if (!sideReady || (curve === 'new' ? settingsLoading || saved.isLoading : saved.isLoading || (isLoading && !data) || notesLoading)) {
       return <Skeleton className="h-[520px]" />
     }
     const editorKey = `${curve}:${side}`
     const found: EditingCurve | null = curve === 'new'
       ? { days: [], setPoints: [], endAction: settings?.device.defaultScheduleEndAction ?? 'turn_off' }
-      : group ? { days: group.days, setPoints: group.setPoints, endAction: group.endAction } : null
+      : owned
+        ? {
+            id: owned.id,
+            name: owned.name,
+            active: owned.active,
+            curveDays: owned.days,
+            days: [...new Set(viewSides.flatMap(s => owned.days[s]))],
+            setPoints: templateSetPoints(owned),
+            endAction: owned.endAction,
+            notes: owned.notes,
+          }
+        : group ? { days: group.days, setPoints: group.setPoints, endAction: group.endAction, notes: notesFor(group.days) } : null
     if (found && openedCurve?.key !== editorKey) setOpenedCurve({ key: editorKey, editor: found })
     const editor = openedCurve?.key === editorKey ? openedCurve.editor : found
     if (!editor) {
@@ -208,9 +290,11 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
             <InlineError>
               {error
                 ? `Failed to load schedules: ${error.message}`
-                : linkedDays
-                  ? `No curve runs on exactly ${formatDayRange(linkedDays)}. It may have been changed or deleted.`
-                  : `"${curve}" isn't a curve.`}
+                : curveId !== null
+                  ? 'That curve is no longer in the library. It may have been deleted.'
+                  : linkedDays
+                    ? `No curve runs on exactly ${formatDayRange(linkedDays)}. It may have been changed or deleted.`
+                    : `"${curve}" isn't a curve.`}
             </InlineError>
           </Card>
         </>
@@ -223,6 +307,11 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
         initialEndAction={editor.endAction}
         initialDays={editor.days}
         initialSetPoints={editor.setPoints}
+        initialNotes={editor.notes}
+        curveId={editor.id}
+        initialName={editor.name}
+        initialActive={editor.active}
+        curveDays={editor.curveDays}
       />
     )
   }
@@ -287,8 +376,6 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
 
       <div className="grid gap-3.5 min-[900px]:gap-4 @min-[960px]:grid-cols-[minmax(0,1fr)_300px]">
         <div className="flex min-w-0 flex-col gap-3.5 min-[900px]:gap-4">
-          <SectionLabel className="mt-1 min-[900px]:hidden">Curves</SectionLabel>
-
           {error && (
             <Card>
               <InlineError>
@@ -301,7 +388,7 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
 
           {isLoading && !data && <Skeleton className="h-[140px] min-[900px]:h-[380px]" />}
 
-          {!isLoading && !error && !hasAnyCurves && (
+          {!isLoading && !error && !hasAnyCurves && libraryCurves.length === 0 && (
             <Card dashed className="items-center py-8 text-center">
               <span className="text-[15px] font-medium">No schedule yet</span>
               <span className="text-[13px] text-fg-2">
@@ -329,28 +416,52 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
               isActive={featured.key === activeCurveKey}
               nextEvent={featured.key === activeCurveKey ? nextEvent : null}
               bed={bed}
+              notes={notesFor(featured.days)}
+              name={featuredOwner?.name}
             />
           )}
 
-          {!both && hasAnyCurves && (
+          {!both && others.length > 0 && (
             <div className="grid gap-3.5 min-[900px]:grid-cols-3 min-[900px]:gap-3">
               {others.map(group => (
                 <CurveCard
                   key={group.key}
                   group={group}
+                  notes={notesFor(group.days)}
                   onEdit={() => handleEdit(group)}
                   onDelete={() => handleDelete(group)}
+                  unsaved
                 />
               ))}
-              <Button
-                variant="dashed"
-                icon={Plus}
-                onClick={handleCreate}
-                className="h-11 rounded-card text-sm min-[900px]:h-auto min-[900px]:min-h-[108px] min-[900px]:text-[13px]"
-              >
-                Create curve
-              </Button>
             </div>
+          )}
+
+          {(hasAnyCurves || libraryCurves.length > 0) && (
+            <>
+              <SectionLabel className="mt-1">Curves</SectionLabel>
+              {libraryError && <InlineError>{libraryError}</InlineError>}
+              <div className="grid gap-3.5 min-[900px]:grid-cols-3 min-[900px]:gap-3">
+                {libraryCurves.map(t => (
+                  <SavedCurveCard
+                    key={t.id}
+                    template={t}
+                    daysLabel={curveDaysLabel(t, viewSides, names)}
+                    busy={saved.isChanging}
+                    onOpen={() => openCurve(t)}
+                    onToggle={next => toggleCurve(t, next)}
+                    onDelete={() => setPendingSavedDelete(t)}
+                  />
+                ))}
+                <Button
+                  variant="dashed"
+                  icon={Plus}
+                  onClick={handleCreate}
+                  className="h-11 rounded-card text-sm min-[900px]:h-auto min-[900px]:min-h-[108px] min-[900px]:text-[13px]"
+                >
+                  Create curve
+                </Button>
+              </div>
+            </>
           )}
         </div>
 
@@ -359,6 +470,33 @@ export function SchedulePage({ curve, curveSide, fromBoth = false }: SchedulePag
           <SchedulerStatus sideLabel={sideLabel} next={next} />
         </div>
       </div>
+
+      <ConfirmDialog
+        open={pendingSavedDelete !== null}
+        title="Delete curve?"
+        message={pendingSavedDelete?.active
+          ? `"${pendingSavedDelete.name}" will be removed and stop running on ${curveDaysLabel(pendingSavedDelete, ['left', 'right'], names)}. The Pod won't change temperature on those days until another curve runs on them.`
+          : `"${pendingSavedDelete?.name ?? ''}" will be removed from your curves.`}
+        confirmLabel="Delete"
+        variant="danger"
+        busy={saved.isDeleting}
+        onConfirm={() => {
+          if (pendingSavedDelete) void saved.remove(pendingSavedDelete.name).finally(() => setPendingSavedDelete(null))
+        }}
+        onCancel={() => setPendingSavedDelete(null)}
+      />
+
+      <ConfirmDialog
+        open={pendingToggle !== null}
+        title="Move days to this curve?"
+        message={pendingToggle ? `${describeMoves(pendingToggle.moves, names, viewSides)}. Turn on ${pendingToggle.curve.name}?` : ''}
+        confirmLabel={saved.isChanging ? 'Turning on…' : 'Move & turn on'}
+        busy={saved.isChanging}
+        onConfirm={() => {
+          if (pendingToggle) void runToggle(pendingToggle.curve, true)
+        }}
+        onCancel={() => setPendingToggle(null)}
+      />
 
       <ConfirmDialog
         open={pendingDelete !== null}

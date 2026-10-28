@@ -2,7 +2,10 @@ import { base } from './base'
 import { archivePush } from './archivePush'
 import { automations } from './automations'
 import { biometrics } from './biometrics'
+import { biometricShadow } from './biometricShadow'
+import { biometricTuning } from './biometricTuning'
 import { calibration } from './calibration'
+import { curveTemplates } from './curveTemplates'
 import { databases } from './databases'
 import { device } from './device'
 import { environment } from './environment'
@@ -14,6 +17,7 @@ import { raw } from './raw'
 import { runOnce } from './runOnce'
 import { schedules } from './schedules'
 import { settings } from './settings'
+import { sleepStages } from './sleepStages'
 import { system } from './system'
 import { waterLevel } from './waterLevel'
 
@@ -22,7 +26,10 @@ export const demoRouters = {
   archivePush,
   automations,
   biometrics,
+  biometricTuning,
+  biometricShadow,
   calibration,
+  curveTemplates,
   databases,
   device,
   environment,
@@ -34,6 +41,7 @@ export const demoRouters = {
   runOnce,
   schedules,
   settings,
+  sleepStages,
   system,
   waterLevel,
 } as const

@@ -27,6 +27,12 @@ interface CurveCardProps {
   featured?: boolean
   /** Featured only: measured bed temperature on the chart's minute axis, with its legend label ("last night"). */
   bed?: { samples: BedSample[], label: string }
+  /** The curve's optional note. */
+  notes?: string
+  /** Name of the library curve running these days. */
+  name?: string
+  /** These days run a schedule that is not in the library. */
+  unsaved?: boolean
 }
 
 /** "79–84°F" / "79–84°" — set-point range in the user's unit. */
@@ -145,12 +151,13 @@ function stop(fn: () => void) {
   }
 }
 
-export function CurveCard({ group, onEdit, onDelete, isActive = false, nextEvent = null, featured = false, bed }: CurveCardProps) {
+export function CurveCard({ group, onEdit, onDelete, isActive = false, nextEvent = null, featured = false, bed, notes, name, unsaved = false }: CurveCardProps) {
   const { timeFormat } = useTimeFormatter()
   const { unit } = useTemperatureUnit()
   const hasSetPoints = group.setPoints.length > 0
   const paused = !!group.allDisabled
-  const label = formatDayRange(group.days)
+  const days = formatDayRange(group.days)
+  const label = name ? `${name} · ${days}` : days
   const sleepWindow = formatWindow(group.setPoints, timeFormat)
   const active = isActive && hasSetPoints && !paused
 
@@ -188,12 +195,14 @@ export function CurveCard({ group, onEdit, onDelete, isActive = false, nextEvent
         <div className="hidden flex-col gap-3.5 min-[900px]:flex">
           <CurveChart setPoints={group.setPoints} height={220} showNow={active} bed={bed?.samples} />
           <PhaseStrip endAction={group.endAction} setPoints={group.setPoints} className="border-t border-line pt-3.5" />
+          {notes && <p className="whitespace-pre-line text-[13px] text-fg-2">{notes}</p>}
         </div>
 
         {/* Phone: sparkline + next set point */}
         <div className="flex flex-col gap-2 min-[900px]:hidden">
           <MiniCurve setPoints={group.setPoints} height={44} />
           <span className="font-mono text-xs text-fg-2">{meta}</span>
+          {notes && <p className="line-clamp-2 text-xs text-fg-2">{notes}</p>}
           {active && nextEvent && (
             <span className="border-t border-line pt-2 font-mono text-xs text-fg-2">
               Next
@@ -219,6 +228,7 @@ export function CurveCard({ group, onEdit, onDelete, isActive = false, nextEvent
       <div className="flex min-w-0 items-center gap-2">
         <span className="truncate text-[15px] font-medium min-[900px]:text-sm">{label}</span>
         {paused && <Badge variant="paused" />}
+        {unsaved && <span className="font-mono text-[10px] tracking-wide text-fg-3">NOT SAVED</span>}
         {actions}
       </div>
       {paused
@@ -226,6 +236,7 @@ export function CurveCard({ group, onEdit, onDelete, isActive = false, nextEvent
             <div className="flex items-center text-xs text-fg-3 min-[900px]:h-8">No set points active</div>
           )
         : hasSetPoints && <MiniCurve setPoints={group.setPoints} className="hidden min-[900px]:block" />}
+      {notes && <p className="line-clamp-2 text-xs text-fg-2">{notes}</p>}
       <span className="font-mono text-xs text-fg-2">
         {paused
           ? 'Schedule paused'

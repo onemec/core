@@ -163,6 +163,14 @@ changes in `node_modules` and module/systemd changes are not rolled back.
 
 The pod has 2GB RAM and no swap. Next.js 16 with Turbopack needs more memory than this for the build step. Instead of fighting that constraint, we build where resources are abundant (Mac or CI runner) and deploy only the runtime artifacts.
 
+**Changing the code:** edit on your computer and deploy with
+`./scripts/deploy POD_IP`. Do not run `pnpm build` or `next build` on the pod:
+Next deletes the installed `.next` before compiling, the build runs out of
+memory, and the service is left with no `.next/standalone/server.js` to start.
+`next.config.mjs` refuses to build when `/etc/sleepypod/data-dir` exists
+(override with `SP_ALLOW_POD_BUILD=1`). If it happens anyway, `sp-update`
+reinstalls the latest release.
+
 The `.next` output is platform-independent JavaScript — only `better-sqlite3` requires a platform-specific binary, which `prebuild-install` handles automatically on the pod.
 
 ## Design Decisions
@@ -217,6 +225,17 @@ sp-status              # systemctl status sleepypod.service
 sp-restart             # restart the service
 sp-logs                # tail service logs (journalctl -f)
 sp-update [branch]     # self-update from GitHub (handles iptables)
+```
+
+## Accessing the Pod by Hostname
+
+The API has no authentication, so the server rejects any `Host` header that isn't a pod address (HTTP 403). This stops DNS-rebinding pages. These work out of the box: IP addresses (`http://192.168.1.88:3000`), `localhost`, single-label names (`eight-pod`), and names ending in `.local`, `.lan`, `.home.arpa`, `.internal` or `.localhost`. To reach the pod through another name, such as a Tailscale MagicDNS name or a reverse proxy, list it in `SLEEPYPOD_ALLOWED_HOSTS`. Entries are comma-separated, and each is an exact host or `*.suffix`:
+
+```bash
+sudo mkdir -p /etc/systemd/system/sleepypod.service.d
+printf '[Service]\nEnvironment="SLEEPYPOD_ALLOWED_HOSTS=pod.tail1234.ts.net,*.example.com"\n' \
+  | sudo tee /etc/systemd/system/sleepypod.service.d/allowed-hosts.conf
+sudo systemctl daemon-reload && sp-restart
 ```
 
 ## Network Security (Telemetry Blocking)
@@ -285,3 +304,57 @@ sudo bash /tmp/sleepypod-install --purge-free-sleep
 It also flushes the running iptables and ip6tables rules; the install then reconfigures iptables itself. Without the flag, run the cleanup block the installer prints, reboot, and re-run the installer. free-sleep's `unblock_internet_access.sh` is not a substitute: it flushes runtime rules only and leaves the persisted files in place.
 
 Run `sp-uninstall` if you want to revert (the script flushes iptables and removes sleepypod's units); the purge is not undone, so reinstall free-sleep from its own installer.
+
+
+### Runtime filesystem reads and standalone tracing
+
+Pod data (RAW captures, saved alarm state, HomeKit identity seeds, archive-push
+configuration, procfs and storage-accounting paths) is read on the destination
+pod. These dynamic filesystem reads use `turbopackIgnore` call annotations so
+Next does not infer that the build machine's whole checkout belongs in the
+standalone output. The annotations affect packaging only; existing validation,
+file access and error handling still run on the pod.
+
+The biometrics worker location probes are also excluded from automatic tracing:
+`scripts/build/biometrics-worker.mjs` explicitly generates `worker.cjs`,
+`coordinator.cjs` and `shadow-host.cjs` in the standalone bundle after Next builds.
+Keep that packaging step and its dependency-graph checks when changing tracing.
+Do not apply these annotations to shipped assets that need inclusion in a release.
+
+## Optional recording controls
+
+System → Storage → Data recording controls app diagnostic logs, the Health
+status timeline and compressed RAW waveform archives independently. It does
+not disable hardware safety checks, live sensing, biometric database records,
+module lifecycle status, firmware/OS logs or hourly flash-write measurements.
+Existing saved data remains subject to its normal retention policy.
+
+- **Quiet** (default) emits core console and bundled Python warnings/errors.
+  **Off** suppresses those application logs. Direct third-party stdout/stderr
+  and firmware logs are outside this control. The installer configures the
+  system journal in RAM, so suppressing these logs primarily saves processing
+  and memory rather than further flash writes.
+- **Debug for 15 minutes** temporarily permits all application log levels,
+  then returns to the selected Quiet/Off setting. Expiry is an absolute
+  timestamp, evaluated at each log call; it survives process restarts and
+  needs no timer-driven persistent write. Existing RAM logs remain until
+  journal rotation or reboot.
+- Disabling **Health timeline** skips new `health_runs` samples (within one
+  minute). Live diagnostic queries and the module `system_health` lifecycle
+  records continue. Re-enabling starts fresh timeline runs.
+- Disabling **Raw waveform archive** stops future gzip writes. A file already
+  being compressed may finish. The linker releases pending RAM pins within
+  one minute; the archiver still removes completed temporary files using its
+  normal age threshold so firmware that retains RAW files cannot fill tmpfs.
+  Firmware's current files and existing compressed archives are preserved.
+  This applies to the legacy RAW/tmpfs archiver, not NATS-managed telemetry.
+
+Preferences live in `recording-policy.json` beside `DATABASE_URL` (normally
+`/persistent/sleepypod-data/`). The core writes the complete JSON atomically
+only when a setting changes; Python readers cache it for at most one second.
+The archiver resolves the same directory via `DATABASE_URL` or
+`/etc/sleepypod/data-dir`. `SP_RECORDING_POLICY_FILE` overrides the path for
+isolated tests. The file is shared with shell/Python services intentionally,
+so no SQLite schema change or privileged service restart is needed to apply
+preferences. Deploy the core, Python common module and archiver scripts
+together using the normal updater.

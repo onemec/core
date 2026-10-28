@@ -27,11 +27,17 @@ vi.mock('@/src/hooks/useWeekNavigator', () => ({
 vi.mock('@/src/utils/trpc', () => ({
   trpc: {
     biometrics: {
+      getReferenceStages: { useQuery: () => ({ data: [] }) },
+      getReferenceVitals: { useQuery: () => ({ data: [] }) },
+      getMovementBuckets: { useQuery: () => ({ data: [] }) },
+      getReferenceSamples: { useQuery: () => ({ data: [] }) },
       getSleepRecords: { useQuery: state.sleep },
       getSleepStages: { useQuery: state.stages },
       getVitals: { useQuery: state.vitals },
       getMovement: { useQuery: state.movement },
     },
+    calibration: { getStatus: { useQuery: () => ({ data: undefined, isLoading: false }) } },
+    sleepStages: { getClassifier: { useQuery: () => ({ data: undefined, isLoading: false }) } },
     settings: { getAll: { useQuery: () => ({ data: { sides: { left: { name: 'Jon' }, right: { name: 'Heidi' } } } }) } },
   },
 }))

@@ -1,8 +1,15 @@
 import linguiConfig from 'lingui.config'
 import Negotiator from 'negotiator'
 import { type NextRequest, NextResponse } from 'next/server'
+import { rejectUnknownHost } from '@/src/lib/hostAllowlist'
 
 const { locales } = linguiConfig
+
+// Paths served without a locale prefix:
+//   api    — tRPC + REST endpoints, no locale needed
+//   panel  — tRPC panel dev tool, served as a plain route handler
+//   vendor — static vendored scripts in public/vendor (three.js fallback)
+const NO_LOCALE_PATH = /^\/(?:api|panel(?:\/|$)|vendor\/)/
 
 const getRequestLocale = (requestHeaders: Headers): string => {
   const langHeader = requestHeaders.get('accept-language') || undefined
@@ -17,7 +24,16 @@ const getRequestLocale = (requestHeaders: Headers): string => {
 }
 
 export const proxy = (request: NextRequest) => {
+  const rejected = rejectUnknownHost(request)
+  if (rejected) {
+    return rejected
+  }
+
   const { pathname } = request.nextUrl
+
+  if (NO_LOCALE_PATH.test(pathname)) {
+    return
+  }
 
   console.log('Current pathname:', pathname)
   const pathnameHasLocale = locales.some(
@@ -38,12 +54,13 @@ export const proxy = (request: NextRequest) => {
   return NextResponse.redirect(request.nextUrl)
 }
 
-// Routes excluded from locale redirect:
-//   api    — tRPC + REST endpoints, no locale needed
-//   panel  — tRPC panel dev tool, served as a plain route handler
-//   vendor — static vendored scripts in public/vendor (three.js fallback)
+// Every API route and page runs the Host check. Build output and images are
+// left out: they carry no pod data. Next buffers a matched request's body and
+// silently truncates it at 10 MB (proxyClientMaxBodySize), so the Health
+// export upload is left out too and runs the Host check itself.
 export const config = {
   matcher: [
-    '/((?!api|panel(?:/|$)|vendor/|_vercel|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
+    '/api/((?!biometrics/watch-upload(?:/|$)).*)',
+    '/((?!api|_vercel|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
   ],
 }

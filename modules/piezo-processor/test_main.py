@@ -40,6 +40,7 @@ _spec = importlib.util.spec_from_file_location(
     "common.bed_presence", Path(__file__).resolve().parent.parent / "common" / "bed_presence.py")
 _stubs["common.bed_presence"] = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_stubs["common.bed_presence"])
+_stubs["common"].__path__ = [str(Path(__file__).resolve().parent.parent / "common")]
 sys.modules.update(_stubs)
 
 from main import (  # noqa: E402
@@ -52,6 +53,7 @@ from main import (  # noqa: E402
     FrzHealthPumpState,
     PUMP_OFF_GUARD_S,
     PUMP_ACTIVE_RPM_MIN,
+    PUMP_COUPLING_STD_FACTOR,
     HRTracker,
     PresenceDetector,
     PumpGate,
@@ -1088,6 +1090,222 @@ class TestWriteVitalsResilience:
         assert rows == [("right",)]
 
 
+class TestPresenceDetectorRelaxedReentry:
+    """With the bed confirmed occupied by the capacitance sensor, re-entry
+    uses the exit criteria instead of the (much higher) enter threshold, so a
+    sleeper who went quiet resumes vitals without a hard movement."""
+
+    def _absent_after_quiet(self):
+        pd = PresenceDetector()
+        pd.update(1_000_000, 0.8)
+        for _ in range(pd.exit_count):
+            pd.update(50_000, 0.05)
+        assert pd.state == PresenceDetector.ABSENT
+        return pd
+
+    def test_moderate_signal_does_not_reenter_by_default(self):
+        pd = self._absent_after_quiet()
+        # Between exit (150k) and enter (400k), autocorr below 0.45.
+        assert pd.update(250_000, 0.3) is False
+        assert pd.state == PresenceDetector.ABSENT
+
+    def test_moderate_signal_reenters_when_relaxed(self):
+        pd = self._absent_after_quiet()
+        assert pd.update(250_000, 0.3, relaxed=True) is True
+        assert pd.state == PresenceDetector.PRESENT
+        assert pd.consecutive_low == 0
+
+    def test_relaxed_reentry_on_autocorrelation_alone(self):
+        pd = self._absent_after_quiet()
+        # Energy still weak, but rhythm above the exit bar (0.225).
+        assert pd.update(50_000, 0.3, relaxed=True) is True
+
+    def test_weak_window_stays_absent_even_when_relaxed(self):
+        pd = self._absent_after_quiet()
+        assert pd.update(100_000, 0.1, relaxed=True) is False
+        assert pd.state == PresenceDetector.ABSENT
+
+    def test_relaxed_flag_does_not_change_exit_behaviour(self):
+        pd = PresenceDetector()
+        pd.update(1_000_000, 0.8, relaxed=True)
+        for _ in range(pd.exit_count - 1):
+            assert pd.update(50_000, 0.05, relaxed=True) is True
+        assert pd.update(50_000, 0.05, relaxed=True) is False
+        assert pd.state == PresenceDetector.ABSENT
+
+    def test_first_entry_from_cold_start_is_also_relaxed(self):
+        pd = PresenceDetector()
+        assert pd.update(200_000, 0.1, relaxed=True) is True
+
+
+class TestPumpCouplingGuardWithBedPresence:
+    """Both pumps running (Pod 5 steady state) raise the piezo re-entry bar
+    to PUMP_COUPLING_STD_FACTOR x enter and acr > 0.6. That guard exists to
+    tell a person from pump vibration; when the capacitance sensor already
+    says a person is in bed it must step aside. Regression for the 05:57-07:01
+    blackout on 2026-10-11 (sleeper went quiet, cap-sense occupied all along,
+    pumps at 1941/2008 rpm, piezo stayed ABSENT until a hard movement)."""
+
+    def _pumps_both_on(self):
+        ps = FrzHealthPumpState()
+        ps.update({"type": "frzHealth",
+                   "left": {"pumpRpm": 1941}, "right": {"pumpRpm": 2008}})
+        assert ps.is_symmetric_active()
+        return ps
+
+    def _proc(self, bed, acr):
+        import main
+        conn = TestWriteVitalsResilience()._make_db()
+        proc = main.SideProcessor("left", main.DBHolder(conn), pump_state=self._pumps_both_on())
+        seen = []
+        proc.sink = lambda cand: seen.append(cand) or True
+        if bed != "unset":
+            proc.bed_occupied = lambda: bed
+        return proc, seen
+
+    def _moderate_signal(self, proc):
+        """A BCG signal whose filtered energy clears the normal enter
+        threshold but not the pump-coupling bar."""
+        import main
+        np.random.seed(7)
+        sig = make_bcg_signal(62, 15, noise_level=0.05)
+        filt = main._bandpass(sig, 1.0, 10.0, FS)
+        w = int(5 * FS)
+        med = float(np.median([np.std(filt[j:j + w]) for j in range(0, len(filt) - w + 1, w)]))
+        enter = proc._presence.enter_threshold
+        assert enter < med < enter * PUMP_COUPLING_STD_FACTOR, med
+        return sig
+
+    def _run(self, bed, acr=0.5):
+        import main
+        proc, seen = self._proc(bed, acr)
+        sig = self._moderate_signal(proc)
+        # Autocorrelation above the normal bar (0.45) but below the coupling bar (0.6).
+        with patch("main._autocorr_quality", return_value=acr), \
+                patch("main.time.time", return_value=1_000_000.0):
+            proc.ingest(sig)
+        return proc, seen
+
+    def test_guard_suppresses_moderate_signal_when_bed_presence_unknown(self):
+        proc, seen = self._run(None)
+        assert proc._presence.state == PresenceDetector.ABSENT
+        assert seen == []
+
+    def test_guard_suppresses_when_no_bed_presence_configured(self):
+        proc, seen = self._run("unset")
+        assert proc._presence.state == PresenceDetector.ABSENT
+        assert seen == []
+
+    def test_bed_occupied_bypasses_guard_and_resumes_vitals(self):
+        proc, seen = self._run(True)
+        assert proc._presence.state == PresenceDetector.PRESENT
+        assert len(seen) == 1
+        assert seen[0].heart_rate is not None
+
+    def test_bed_occupied_relaxes_reentry_below_the_normal_enter_bar(self):
+        import main
+        proc, seen = self._proc(True, 0.3)
+        np.random.seed(7)
+        sig = make_bcg_signal(62, 15, noise_level=0.05) * 0.6
+        filt = main._bandpass(sig, 1.0, 10.0, FS)
+        w = int(5 * FS)
+        med = float(np.median([np.std(filt[j:j + w]) for j in range(0, len(filt) - w + 1, w)]))
+        assert proc._presence.exit_threshold < med < proc._presence.enter_threshold, med
+        with patch("main._autocorr_quality", return_value=0.3), \
+                patch("main.time.time", return_value=1_000_000.0):
+            proc.ingest(sig)
+        assert proc._presence.state == PresenceDetector.PRESENT
+        assert len(seen) == 1
+
+    def test_bed_empty_never_relaxes_the_guard(self):
+        proc, seen = self._run(False, acr=0.9)
+        assert proc._presence.state == PresenceDetector.ABSENT
+        assert seen == []
+
+    def test_weak_signal_in_an_occupied_bed_writes_nothing(self):
+        import main
+        proc, seen = self._proc(True, 0.05)
+        sig = make_noise(15, amplitude=20_000)
+        with patch("main._autocorr_quality", return_value=0.05), \
+                patch("main.time.time", return_value=1_000_000.0):
+            proc.ingest(sig)
+        assert proc._presence.state == PresenceDetector.ABSENT
+        assert seen == []
+
+    def test_cross_channel_rejected_side_is_not_relaxed_into_presence(self):
+        """Single-sleeper mode: both sides read the home side as occupied,
+        so the away side (coupling from the sleeper, weaker energy, rejected
+        by the other side's stronger signal) must stay ABSENT even though
+        its energy alone clears the relaxed re-entry bar."""
+        import main
+        proc, seen = self._proc(True, 0.3)
+        other = main.SideProcessor("right", main.DBHolder(TestWriteVitalsResilience()._make_db()))
+        other._last_med_std = proc._presence.enter_threshold * 2
+        other._last_acr_qual = 0.8
+        proc._other = other
+        np.random.seed(7)
+        sig = make_bcg_signal(62, 15, noise_level=0.05) * 0.6
+        with patch("main._autocorr_quality", return_value=0.3), \
+                patch("main.time.time", return_value=1_000_000.0):
+            proc.ingest(sig)
+        assert proc._last_acr_qual == 0.0
+        assert proc._presence.state == PresenceDetector.ABSENT
+        assert seen == []
+
+    def test_away_side_inherits_home_occupancy_but_not_relaxation(self):
+        """Single sleeper on the left: both processors read the left zone as
+        occupied. The right (away) side's own pump coupling, in the band the
+        guard exists for, must stay behind the guard — only the home side
+        may treat the merged occupancy as its own."""
+        import main
+        proc, seen = self._proc(True, 0.5)
+        proc.side = "right"
+        proc.home_side = lambda: "left"
+        sig = self._moderate_signal(proc)
+        with patch("main._autocorr_quality", return_value=0.5), \
+                patch("main.time.time", return_value=1_000_000.0):
+            proc.ingest(sig)
+        assert proc._presence.state == PresenceDetector.ABSENT
+        assert seen == []
+
+    def test_home_side_in_single_sleeper_mode_is_relaxed(self):
+        proc, seen = self._proc(True, 0.5)
+        proc.home_side = lambda: "left"
+        sig = self._moderate_signal(proc)
+        with patch("main._autocorr_quality", return_value=0.5), \
+                patch("main.time.time", return_value=1_000_000.0):
+            proc.ingest(sig)
+        assert proc._presence.state == PresenceDetector.PRESENT
+        assert len(seen) == 1
+
+    def test_later_cross_channel_rejection_ends_relaxed_presence(self):
+        """Relaxed entry before the sibling's values arrive, then the sibling
+        shows the stronger signal: rejection must count as weak windows so
+        presence exits through the normal hysteresis instead of latching on
+        energy alone."""
+        import main
+        proc, seen = self._proc(True, 0.3)
+        proc._pump_state = None
+        other = main.SideProcessor("right", main.DBHolder(TestWriteVitalsResilience()._make_db()))
+        proc._other = other
+        np.random.seed(7)
+        sig = make_bcg_signal(62, 15, noise_level=0.05) * 0.6
+        states = []
+        with patch("main._autocorr_quality", return_value=0.3):
+            for cycle in range(1 + proc._presence.exit_count):
+                if cycle == 1:
+                    other._last_med_std = proc._presence.enter_threshold * 2
+                    other._last_acr_qual = 0.8
+                with patch("main.time.time", return_value=1_000_000.0 + cycle * 61):
+                    proc.ingest(sig)
+                states.append(proc._presence.state)
+        assert states[0] == PresenceDetector.PRESENT
+        assert states[-1] == PresenceDetector.ABSENT
+        # Only the window before rejection produced vitals; the rejected
+        # windows advance the exit count but are never submitted.
+        assert len(seen) == 1
+
+
 class TestSideProcessorAbsenceThrottle:
     """_maybe_write must update _last_write on 'no user' so return from
     extended absence doesn't trigger burst processing until the first write
@@ -1789,3 +2007,423 @@ class TestDetectorCheckpointVitals:
         path = tmp_path / "state.json"
         detector.save_state(path, [tracker])
         self.vitals(path, now, None)
+
+# ===================================================================
+# Beat detection wiring
+# ===================================================================
+
+
+def _hb_db():
+    import sqlite3
+    import main
+    conn = TestWriteVitalsResilience()._make_db()
+    conn.execute(
+        """CREATE TABLE heartbeats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, side TEXT, timestamp INTEGER,
+            beats TEXT, quality REAL, UNIQUE(side, timestamp))"""
+    )
+    return conn, main.DBHolder(conn)
+
+
+def _hb_rows(conn):
+    import json
+    return [(side, ts, json.loads(beats), q) for side, ts, beats, q in conn.execute(
+        "SELECT side, timestamp, beats, quality FROM heartbeats ORDER BY side, timestamp")]
+
+
+class TestHeartbeatStorage:
+    def test_write_and_ignore_replayed_minute(self):
+        import main
+        from beats import Chunk
+        conn, holder = _hb_db()
+        chunk = Chunk(1_790_000_040, [120, 1110, None, 3050], 0.8766)
+        assert main.write_heartbeats(holder, "left", chunk) is True
+        assert main.write_heartbeats(holder, "left", chunk) is True  # restart replay
+        assert _hb_rows(conn) == [("left", 1_790_000_040, [120, 1110, None, 3050], 0.877)]
+
+    def test_missing_table_is_reported_not_raised(self):
+        import main
+        from beats import Chunk
+        conn = TestWriteVitalsResilience()._make_db()
+        assert main.write_heartbeats(main.DBHolder(conn), "left", Chunk(60, [1], 0.5)) is False
+
+
+class TestBeatFrontRouting:
+    def _front(self, home):
+        import main
+        conn, holder = _hb_db()
+        return main.BeatFront(holder, _Mode(home)), conn
+
+    def test_per_side_writes_each_side(self):
+        from beats import Chunk
+        front, conn = self._front(None)
+        front._write({"left": [Chunk(60, [0, 1000], 0.9)], "right": [Chunk(60, [5, 1005], 0.7)]})
+        assert [(r[0], r[1]) for r in _hb_rows(conn)] == [("left", 60), ("right", 60)]
+
+    def test_single_sleeper_keeps_the_better_side_under_home(self):
+        from beats import Chunk
+        front, conn = self._front("left")
+        # Rolled onto the right: its chunk has more beats this minute.
+        front._write({"left": [Chunk(60, [0, None, 3000], 0.6)],
+                      "right": [Chunk(60, [0, 1000, 2000, 3000], 0.9)]})
+        assert _hb_rows(conn) == [("left", 60, [0, 1000, 2000, 3000], 0.9)]
+
+    def _occupied(self, front, left_open, right_open):
+        """Both sides present, each tracker still open at the given minute."""
+        front._was_present = {"left": True, "right": True}
+        front.trackers["left"]._chunk_start = left_open
+        front.trackers["right"]._chunk_start = right_open
+
+    def test_single_sleeper_waits_for_the_other_side_to_finish_the_minute(self):
+        from beats import Chunk
+        front, conn = self._front("left")
+        # Left finishes minute 60 first; right is still inside it.
+        self._occupied(front, 120, 60)
+        front._write({"left": [Chunk(60, [0, None, 3000], 0.6)], "right": []})
+        assert _hb_rows(conn) == []
+        # Right finishes it on a later record with the better chunk.
+        self._occupied(front, 120, 120)
+        front._write({"left": [], "right": [Chunk(60, [0, 1000, 2000, 3000], 0.9)]})
+        assert _hb_rows(conn) == [("left", 60, [0, 1000, 2000, 3000], 0.9)]
+
+    def test_a_minute_only_one_side_saw_is_stored_once_the_other_moves_on(self):
+        from beats import Chunk
+        front, conn = self._front("left")
+        self._occupied(front, 120, None)
+        front.trackers["right"]._last_committed_end = 100.0
+        front._write({"left": [Chunk(60, [0, 1000], 0.8)], "right": []})
+        assert _hb_rows(conn) == []
+        front.trackers["right"]._last_committed_end = 130.0
+        front._write({"left": [], "right": []})
+        assert _hb_rows(conn) == [("left", 60, [0, 1000], 0.8)]
+
+    def test_a_held_minute_is_not_kept_past_the_hold_limit(self):
+        import main
+        from beats import Chunk
+        front, conn = self._front("left")
+        self._occupied(front, 120, 60)  # right never moves on
+        front._write({"left": [Chunk(60, [0, 1000], 0.8)], "right": []})
+        front._latest_ts = 120.0 + main.HEARTBEAT_HOLD_MAX_S + 1
+        front._write({"left": [], "right": []})
+        assert _hb_rows(conn) == [("left", 60, [0, 1000], 0.8)]
+
+    def test_switching_sensor_starts_the_minute_with_a_break(self):
+        """The two trackers' beat anchors differ, so no interval may span
+        a minute from one sensor and the next from the other."""
+        from beats import Chunk
+        front, conn = self._front("left")
+        front._write({"left": [Chunk(60, [0, 1000, 2000], 0.9)], "right": [Chunk(60, [80], 0.5)]})
+        front._write({"left": [Chunk(120, [0], 0.5)], "right": [Chunk(120, [80, 1080, 2080], 0.9)]})
+        front._write({"left": [], "right": [Chunk(180, [None, 40, 1040], 0.9)]})
+        assert [r[2] for r in _hb_rows(conn)] == [[0, 1000, 2000], [None, 80, 1080, 2080], [None, 40, 1040]]
+
+    def test_a_held_minute_keeps_the_home_side_it_was_queued_for(self):
+        from beats import Chunk
+        front, conn = self._front("left")
+        self._occupied(front, 120, 60)  # right still inside minute 60
+        front._write({"left": [Chunk(60, [0, 1000], 0.8)], "right": []})
+        front._mode.home = "right"
+        self._occupied(front, 120, 120)
+        front._write({"left": [], "right": []})
+        assert _hb_rows(conn) == [("left", 60, [0, 1000], 0.8)]
+
+    def test_leaving_single_sleeper_mode_stores_held_minutes_first(self):
+        from beats import Chunk
+        front, conn = self._front("left")
+        self._occupied(front, 120, 60)
+        front._write({"left": [Chunk(60, [0, 1000], 0.8)], "right": []})
+        front._mode.home = None
+        front._write({"left": [Chunk(120, [0, 1000], 0.8)], "right": [Chunk(120, [5, 1005], 0.7)]})
+        assert [(r[0], r[1]) for r in _hb_rows(conn)] == [("left", 60), ("left", 120), ("right", 120)]
+
+    def test_entering_single_sleeper_mode_breaks_at_a_sensor_switch(self):
+        """Per-side minutes from the left sensor, then the right sensor wins
+        under the left side: no interval may span the two."""
+        from beats import Chunk
+        front, conn = self._front(None)
+        front._write({"left": [Chunk(60, [0, 1000], 0.9)], "right": []})
+        front._mode.home = "left"
+        front._write({"left": [Chunk(120, [0], 0.2)], "right": [Chunk(120, [80, 1080], 0.9)]})
+        assert [r[2] for r in _hb_rows(conn)] == [[0, 1000], [None, 80, 1080]]
+
+    def test_leaving_the_bed_stores_the_minute_in_progress(self):
+        import main
+        import numpy as np
+        conn, holder = _hb_db()
+        here = {"left": True}
+        front = main.BeatFront(holder, _Mode(None), present=lambda s: here.get(s, False))
+        flushes = []
+        tr = front.trackers["left"]
+        tr.push = lambda *a, **k: None
+        tr.take_chunks = lambda flush_before=None: flushes.append(flush_before) or []
+        x = np.zeros(5)
+        front.push(0.0, x, None, x, None)
+        here["left"] = False
+        front.push(1.0, x, None, x, None)
+        assert flushes == [None, float("inf")]
+
+    def test_a_failed_write_is_retried(self):
+        import main
+        from beats import Chunk
+        conn = TestWriteVitalsResilience()._make_db()
+        holder = main.DBHolder(conn)
+        now = [0.0]
+        front = main.BeatFront(holder, _Mode(None), clock=lambda: now[0])
+        front._write({"left": [Chunk(60, [0, 1000], 0.8)], "right": []})
+        assert holder.write_failures == 1
+        conn.execute("CREATE TABLE heartbeats (id INTEGER PRIMARY KEY AUTOINCREMENT, side TEXT, "
+                     "timestamp INTEGER, beats TEXT, quality REAL, UNIQUE(side, timestamp))")
+        now[0] += main.HEARTBEAT_RETRY_INTERVAL_S
+        front._write({"left": [], "right": []})
+        assert _hb_rows(conn) == [("left", 60, [0, 1000], 0.8)]
+        assert holder.write_failures == 0
+
+    def test_beats_are_stored_compactly(self):
+        import main
+        from beats import Chunk
+        conn, holder = _hb_db()
+        main.write_heartbeats(holder, "left", Chunk(60, [0, None, 1000], 0.8))
+        assert conn.execute("SELECT beats FROM heartbeats").fetchone()[0] == "[0,null,1000]"
+
+    def test_both_trackers_get_the_other_side_as_reference(self):
+        import numpy as np
+        front, _ = self._front(None)
+        calls = {}
+        for side, tr in front.trackers.items():
+            tr.push = (lambda s: lambda ts, o1, o2, r1, r2, masked=False: calls.setdefault(s, (o1, r1)))(side)
+            tr.take_chunks = lambda *a, **k: []
+        l1, r1 = np.full(5, 1), np.full(5, 2)
+        front.push(0.0, l1, None, r1, None)
+        assert calls["left"][0] is l1 and calls["left"][1] is r1
+        assert calls["right"][0] is r1 and calls["right"][1] is l1
+
+    def _spy(self, front):
+        calls = {"left": [], "right": []}
+        for side, tr in front.trackers.items():
+            tr.push = (lambda s: lambda *a, masked=False: calls[s].append("masked" if masked else "push"))(side)
+            tr.gap = (lambda s: lambda: calls[s].append("gap"))(side)
+            tr.take_chunks = lambda *a, **k: []
+        return calls
+
+    def test_only_present_sides_are_tracked(self):
+        import main
+        import numpy as np
+        conn, holder = _hb_db()
+        front = main.BeatFront(holder, _Mode(None), present=lambda s: s == "right")
+        calls = self._spy(front)
+        front.push(0.0, np.zeros(5), None, np.zeros(5), None)
+        assert calls == {"left": [], "right": ["push"]}
+
+    def test_leaving_the_bed_is_one_gap(self):
+        import main
+        import numpy as np
+        conn, holder = _hb_db()
+        here = {"left": True}
+        front = main.BeatFront(holder, _Mode(None), present=lambda s: here.get(s, False))
+        calls = self._spy(front)
+        x = np.zeros(5)
+        front.push(0.0, x, None, x, None)
+        here["left"] = False
+        front.push(1.0, x, None, x, None)
+        front.push(2.0, x, None, x, None)
+        here["left"] = True
+        front.push(3.0, x, None, x, None)
+        assert calls["left"] == ["push", "gap", "push"]
+        assert calls["right"] == []
+
+    def test_a_gated_record_is_pushed_masked_not_as_a_gap(self):
+        import main
+        import numpy as np
+        conn, holder = _hb_db()
+        front = main.BeatFront(holder, _Mode(None), present=lambda s: True)
+        calls = self._spy(front)
+        x = np.zeros(5)
+        front.push(0.0, x, None, x, None, masked=True)
+        assert calls == {"left": ["masked"], "right": ["masked"]}
+
+    def test_rate_hint_reaches_that_sides_tracker(self, monkeypatch):
+        import main
+        conn, holder = _hb_db()
+        front = main.BeatFront(holder, _Mode(None))
+        monkeypatch.setattr(main.time, "time", lambda: 1234.0)
+        front.set_rate_hint("right", 0.9)
+        assert (front.trackers["right"]._hint, front.trackers["right"]._hint_at) == (0.9, 1234.0)
+        assert front.trackers["left"]._hint is None
+
+    def test_rate_hint_is_timed_by_the_record_not_the_wall_clock(self, monkeypatch):
+        """Replayed records are hours old; the hint must age with them."""
+        import main
+        import numpy as np
+        conn, holder = _hb_db()
+        front = main.BeatFront(holder, _Mode(None), present=lambda s: False)
+        monkeypatch.setattr(main.time, "time", lambda: 9_999_999.0)
+        front.push(5000.0, np.zeros(5), None, np.zeros(5), None)
+        front.set_rate_hint("left", 0.9)
+        assert front.trackers["left"]._hint_at == 5000.0
+
+    def test_empty_bed_vibration_writes_no_beats(self):
+        """A steady mechanical rhythm looks like a pulse to the detector;
+        with nobody present it must never reach the table."""
+        import main
+        import numpy as np
+        conn, holder = _hb_db()
+        front = main.BeatFront(holder, _Mode(None), present=lambda s: False)
+        t = np.arange(500) / 500.0
+        for sec in range(180):
+            hum = (4e5 * np.sin(2 * np.pi * 1.9 * (t + sec))).astype(np.int32)
+            front.push(1000.0 + sec, hum, hum, hum, hum)
+        front.flush()
+        assert _hb_rows(conn) == []
+
+
+class TestRateHint:
+    def test_window_rate_is_passed_to_the_beat_tracker(self, monkeypatch):
+        """Each window's tracked heart rate guides the beat tracker (as a
+        period); the vitals themselves are unchanged."""
+        import main
+        from common.biometrics.signal import WindowEstimate
+        proc = main.SideProcessor("left", main.DBHolder(TestWriteVitalsResilience()._make_db()))
+        written = []
+        proc.sink = lambda cand: written.append(cand) or True
+        hints = []
+        proc.rate_hint = hints.append
+        monkeypatch.setattr(proc._estimator, "estimate",
+                            lambda now, *a: WindowEstimate(now, 72.0, 40.0, 15.0, 72.0, 0.9, ()))
+        monkeypatch.setattr(main.PresenceDetector, "update", lambda self, *a, **k: True)
+        proc.ingest(np.random.default_rng(3).normal(0, 5e5, 15 * main.SAMPLE_RATE))
+        assert hints == [pytest.approx(60 / 72)]
+        assert written[0].heart_rate == 72.0 and written[0].hrv == 40.0
+
+    def test_no_hint_without_a_heart_rate(self, monkeypatch):
+        import main
+        from common.biometrics.signal import WindowEstimate
+        proc = main.SideProcessor("left", main.DBHolder(TestWriteVitalsResilience()._make_db()))
+        proc.sink = lambda cand: True
+        hints = []
+        proc.rate_hint = hints.append
+        monkeypatch.setattr(proc._estimator, "estimate",
+                            lambda now, *a: WindowEstimate(now, None, None, 15.0, None, 0.0, ()))
+        monkeypatch.setattr(main.PresenceDetector, "update", lambda self, *a, **k: True)
+        proc.ingest(np.random.default_rng(3).normal(0, 5e5, 15 * main.SAMPLE_RATE))
+        assert hints == []
+
+
+
+class TestHeartbeatRetryBackoff:
+    @pytest.mark.parametrize('message', ['database is locked', 'disk I/O error'])
+    def test_outage_backoff_preserves_order_and_limits_reconnects(self, monkeypatch, message):
+        import sqlite3
+        import main
+        from beats import Chunk
+        from unittest.mock import MagicMock
+        now = [100.0]
+        conn = MagicMock()
+        conn.execute.side_effect = sqlite3.OperationalError(message)
+        holder = main.DBHolder(conn)
+        reconnect = MagicMock()
+        monkeypatch.setattr(main, '_reconnect_db', reconnect)
+        front = main.BeatFront(holder, _Mode(None), clock=lambda: now[0])
+        chunks = [Chunk(t, [0, 1000], .8) for t in range(60, 601, 60)]
+        front._write({'left': chunks})
+        assert conn.execute.call_count == 1
+        assert holder.write_failures == 1
+        for _ in range(100):
+            front._write({})
+        assert conn.execute.call_count == 1
+        # Even forced shutdown flush must respect backoff.
+        front.flush()
+        assert conn.execute.call_count == 1
+        for attempt in range(2, main._DB_RECONNECT_THRESHOLD + 1):
+            now[0] += main.HEARTBEAT_RETRY_INTERVAL_S
+            front._write({})
+            assert conn.execute.call_count == attempt
+        assert reconnect.call_count == 1
+        assert holder.write_failures == 0
+        assert [c for _, c in front._retry] == chunks
+        conn.execute.side_effect = None
+        now[0] += main.HEARTBEAT_RETRY_INTERVAL_S
+        front._write({'right': [Chunk(660, [0], .7)]})
+        successful = conn.execute.call_args_list[main._DB_RECONNECT_THRESHOLD:]
+        assert [call.args[1][1] for call in successful] == list(range(60, 661, 60))
+        assert front._retry == []
+        assert holder.write_failures == 0
+
+    def test_failure_after_success_stops_and_capacity_stays_bounded(self, monkeypatch):
+        import main
+        from beats import Chunk
+        from unittest.mock import Mock
+        conn, holder = _hb_db()
+        writer = Mock(side_effect=[True, False])
+        monkeypatch.setattr(main, 'write_heartbeats', writer)
+        front = main.BeatFront(holder, _Mode(None), clock=lambda: 0)
+        front._write({'left': [Chunk(t, [0], .8) for t in range(35)]})
+        assert writer.call_count == 2
+        assert len(front._retry) == main.HEARTBEAT_RETRY_MAX
+        assert [c.start for _, c in front._retry] == list(range(5, 35))
+        front._write({})
+        assert writer.call_count == 2
+        conn.close()
+
+class TestHeartbeatLifecycleRetries:
+    @pytest.mark.parametrize('recovers', [True, False])
+    def test_shutdown_gets_one_final_attempt_inside_backoff(self, monkeypatch, recovers):
+        import main
+        from beats import Chunk
+        from unittest.mock import Mock
+        _, holder = _hb_db()
+        writer = Mock(return_value=False)
+        monkeypatch.setattr(main, 'write_heartbeats', writer)
+        front = main.BeatFront(holder, _Mode(None), clock=lambda: 0)
+        chunks = [Chunk(60, [0], .8), Chunk(120, [0], .8)]
+        front._write({'left': chunks})
+        writer.return_value = recovers
+        front.flush(shutdown=True)
+        assert writer.call_count == (3 if recovers else 2)
+        assert [c for _, c in front._retry] == ([] if recovers else chunks)
+        assert [call.args[2].start for call in writer.call_args_list] == ([60, 60, 120] if recovers else [60, 60])
+        holder.conn.close()
+
+    def test_idle_poll_retries_only_after_deadline(self, monkeypatch):
+        import main
+        from beats import Chunk
+        from unittest.mock import Mock
+        _, holder = _hb_db()
+        writer = Mock(return_value=False)
+        monkeypatch.setattr(main, 'write_heartbeats', writer)
+        now = [0.0]
+        front = main.BeatFront(holder, _Mode(None), clock=lambda: now[0])
+        front._write({'left': [Chunk(60, [0], .8)]})
+        writer.return_value = True
+        now[0] = main.HEARTBEAT_RETRY_INTERVAL_S - .01
+        front.tick()
+        assert writer.call_count == 1
+        now[0] += .01
+        front.tick()
+        assert writer.call_count == 2
+        assert front._retry == []
+        holder.conn.close()
+
+    def test_main_wires_idle_poll_and_shutdown_flush(self, monkeypatch, tmp_path):
+        import main
+        from unittest.mock import MagicMock
+        monkeypatch.setattr(main, 'BIOMETRICS_DB', tmp_path / 'biometrics.db')
+        conn = MagicMock()
+        monkeypatch.setattr(main, 'open_biometrics_db', lambda: conn)
+        for name in ['PumpGate', 'FrzHealthPumpState', 'SideProcessor', 'SingleSleeperMode',
+                     'BedPresence', 'RuntimeCoordinator', 'report_health']:
+            monkeypatch.setattr(main, name, MagicMock())
+        front, vitals = MagicMock(), MagicMock()
+        monkeypatch.setattr(main, 'BeatFront', MagicMock(return_value=front))
+        monkeypatch.setattr(main, 'SingleSleeperVitals', MagicMock(return_value=vitals))
+        follower = MagicMock()
+        def read_records(*, on_poll):
+            on_poll()
+            return iter(())
+        follower.read_records.side_effect = read_records
+        monkeypatch.setattr(main, 'create_follower', MagicMock(return_value=follower))
+        main.main()
+        front.tick.assert_called_once_with()
+        vitals.tick.assert_called_once_with()
+        front.flush.assert_called_once_with(shutdown=True)
+        vitals.flush.assert_called_once_with()
+        conn.close.assert_called_once_with()

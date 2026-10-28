@@ -1,12 +1,16 @@
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SleepScreen } from '../SleepScreen'
+import { DEFAULT_STAGE_RULESET } from '@/src/lib/sleep-stage-rules'
 
 const state = vi.hoisted(() => ({
+  reference: vi.fn(),
   sleep: vi.fn(),
   stages: vi.fn(),
   vitals: vi.fn(),
   movement: vi.fn(),
+  calibration: vi.fn(),
+  classifier: vi.fn(),
   week: {
     isCurrentWeek: true,
     goToPreviousWeek: vi.fn(),
@@ -29,14 +33,20 @@ vi.mock('@/src/hooks/useWeekNavigator', () => ({
 vi.mock('@/src/utils/trpc', () => ({
   trpc: {
     biometrics: {
+      getReferenceStages: { useQuery: state.reference },
+      getReferenceVitals: { useQuery: () => ({ data: [] }) },
+      getReferenceSamples: { useQuery: () => ({ data: [] }) },
       getSleepRecords: { useQuery: state.sleep },
       getSleepStages: { useQuery: state.stages },
       getVitals: { useQuery: state.vitals },
       getMovement: { useQuery: state.movement },
     },
+    calibration: { getStatus: { useQuery: state.calibration } },
+    sleepStages: { getClassifier: { useQuery: state.classifier } },
     settings: { getAll: { useQuery: () => ({ data: undefined }) } },
   },
 }))
+vi.mock('../NightVitals', () => ({ NightVitals: ({ side, start, end }: { side: string, start: number, end: number }) => <div data-testid="night-vitals">{`${side}:${start}:${end}`}</div> }))
 vi.mock('@/src/components/MovementChart/MovementChart', () => ({ MovementChart: () => <div data-testid="movement" /> }))
 vi.mock('@/src/components/biometrics/RawDataButton', () => ({ RawDataButton: () => <div data-testid="raw-data" /> }))
 vi.mock('@/src/components/biometrics/SleepRecordActions', () => ({
@@ -77,6 +87,7 @@ beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] })
   vi.setSystemTime(new Date(2026, 8, 28, 12))
   vi.clearAllMocks()
+  state.reference.mockReturnValue({ data: [] })
   state.week.isCurrentWeek = true
   state.sleep.mockImplementation(({ limit }: { limit: number }) => ({ data: limit === 100 ? MONTH : WEEK, isLoading: false }))
   state.stages.mockImplementation(({ sleepRecordId }: { sleepRecordId?: number }) => ({
@@ -85,6 +96,8 @@ beforeEach(() => {
   }))
   state.vitals.mockReturnValue({ data: [], isLoading: false })
   state.movement.mockReturnValue({ data: [], isLoading: false })
+  state.calibration.mockReturnValue({ data: undefined, isLoading: false })
+  state.classifier.mockReturnValue({ data: undefined, isLoading: false })
 })
 afterEach(() => {
   cleanup()
@@ -102,22 +115,28 @@ describe('SleepScreen night view', () => {
     // Asleep excludes the awake epoch (3 × 5 min).
     expect(screen.getByText('Asleep').nextSibling?.textContent).toBe('15m')
     expect(screen.getByText('Bed exits').nextSibling?.textContent).toBe('1')
-    expect(screen.getByText('min 54 · avg 63 · max 70 bpm')).toBeTruthy()
+    expect(screen.getByTestId('night-vitals').textContent).toContain('left:')
     expect(screen.getByTestId('record-actions').textContent).toBe('12')
     expect(screen.getByTestId('raw-data')).toBeTruthy()
   })
 
-  it('reads out the heart rate under the pointer with the epoch time', () => {
-    const { container } = render(<SleepScreen />)
-    // The heart-rate chart is the filled line (two paths) inside a hoverable box.
-    const box = [...container.querySelectorAll('svg')].map(s => s.parentElement).find(p => p?.className.includes('relative') && p.querySelectorAll('path').length === 2) as HTMLElement
-    vi.spyOn(box, 'getBoundingClientRect').mockReturnValue({ x: 0, y: 0, left: 0, top: 0, width: 300, height: 96, right: 300, bottom: 96, toJSON: () => ({}) })
-    fireEvent.pointerMove(box, { clientX: 0, clientY: 10 })
-    expect(screen.getByTestId('chart-hover').textContent).toBe('11:20 PM · 70 bpm')
-    fireEvent.pointerMove(box, { clientX: 300, clientY: 10 })
-    expect(screen.getByTestId('chart-hover').textContent).toBe('11:35 PM · 66 bpm')
-    fireEvent.pointerLeave(box)
-    expect(screen.queryByTestId('chart-hover')).toBeNull()
+  it('marks a night the personal model staged, and says nothing for the rules', () => {
+    render(<SleepScreen />)
+    expect(screen.queryByText('Personal model')).toBeNull()
+    cleanup()
+    state.stages.mockImplementation(() => ({
+      data: { ...stagesFor(at(22, 23, 20), 12), stagedBy: { engine: 'model', version: 'container-forest-test' } },
+      isLoading: false,
+    }))
+    render(<SleepScreen />)
+    expect(screen.getByText('Personal model').getAttribute('title')).toBe('container-forest-test')
+    cleanup()
+    state.stages.mockImplementation(() => ({
+      data: { ...stagesFor(at(22, 23, 20), 12), stagedBy: { engine: 'model', version: null } },
+      isLoading: false,
+    }))
+    render(<SleepScreen />)
+    expect(screen.getByText('Personal model').getAttribute('title')).toBeNull()
   })
 
   it('opens another night from the This week bars', () => {
@@ -177,6 +196,17 @@ describe('SleepScreen week and month views', () => {
     expect(screen.getByText('Monday, Sep 21')).toBeTruthy()
   })
 
+  it('classifies the week once the side\'s calibration and classifier are known', () => {
+    state.calibration.mockReturnValue({ data: { piezo: { qualityScore: 0.9 } }, isLoading: false })
+    state.classifier.mockReturnValue({ data: { classifier: { engine: 'rules', ruleset: DEFAULT_STAGE_RULESET } }, isLoading: false })
+    render(<SleepScreen />)
+    pick('Week')
+    expect(state.calibration).toHaveBeenCalledWith({ side: 'left' })
+    expect(state.classifier).toHaveBeenCalledWith({ side: 'left' })
+    expect(screen.getByText('Sleep timeline')).toBeTruthy()
+    expect(screen.getByText('11:20 PM → 6:50 AM · 7h 30m · quality 78')).toBeTruthy()
+  })
+
   it('shows the month calendar, stats and nights list', () => {
     render(<SleepScreen />)
     pick('Month')
@@ -197,4 +227,12 @@ describe('SleepScreen week and month views', () => {
     expect(screen.getAllByText('August 2026').length).toBeGreaterThan(0)
     expect(state.sleep).toHaveBeenLastCalledWith(expect.objectContaining({ startDate: new Date(2026, 7, 1, 6) }))
   })
+})
+
+it('overlays imported Watch stages for the selected night and side', () => {
+  state.reference.mockReturnValue({ data: [{ start: at(22, 23, 20), end: at(23, 0), stage: 'rem' }] })
+  render(<SleepScreen />)
+  expect(screen.getAllByRole('img', { name: 'Apple Watch sleep stages' })).toHaveLength(2)
+  expect(screen.getByText('Solid line · Apple Watch')).toBeTruthy()
+  expect(state.reference).toHaveBeenCalledWith(expect.objectContaining({ side: 'left', startDate: at(22, 23, 20) }), { enabled: true })
 })

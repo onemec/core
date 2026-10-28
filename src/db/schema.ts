@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm'
 import { index, integer, real, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
+import type { DayOfWeek } from '@/src/lib/scheduleTime'
 
 // ============================================================================
 // Device Settings & Configuration
@@ -93,8 +94,18 @@ export const sideSettings = sqliteTable('side_settings', {
   alwaysOn: integer('always_on', { mode: 'boolean' }).notNull().default(false),
   autoOffEnabled: integer('auto_off_enabled', { mode: 'boolean' }).notNull().default(false),
   autoOffMinutes: integer('auto_off_minutes').notNull().default(30),
+  // Experimental: power the side on once a person has been in bed for
+  // auto_on_minutes, inside the auto_on_start..auto_on_end local-time window
+  // (wraps midnight; equal times mean any time). See services/autoOnWatcher.
+  autoOnEnabled: integer('auto_on_enabled', { mode: 'boolean' }).notNull().default(false),
+  autoOnMinutes: integer('auto_on_minutes').notNull().default(5),
+  autoOnStart: text('auto_on_start').notNull().default('20:00'),
+  autoOnEnd: text('auto_on_end').notNull().default('08:00'),
   awayStart: text('away_start'), // ISO datetime when away mode activates
   awayReturn: text('away_return'), // ISO datetime when away mode deactivates
+  // Sleep stage classifier ({ engine, ruleset }), validated by
+  // stageClassifierSchema; null classifies with the defaults.
+  stageClassifier: text('stage_classifier', { mode: 'json' }),
   createdAt: integer('created_at', { mode: 'timestamp' })
     .notNull()
     .default(sql`(unixepoch())`),
@@ -102,6 +113,53 @@ export const sideSettings = sqliteTable('side_settings', {
     .notNull()
     .default(sql`(unixepoch())`),
 })
+
+/**
+ * Every save of a side's sleep stage classifier, so the editor can list
+ * recent changes with their effect and revert one. `before`/`after` are
+ * classifiers ({ engine, ruleset }) or null for the defaults.
+ */
+/**
+ * A personal sleep-stage model uploaded for a side (sleepypod-ios training or
+ * the analysis container's export), validated by stageModelSchema. It is
+ * scored beside the rules on read; it does not replace the side's classifier.
+ */
+export const sideStageModels = sqliteTable('side_stage_models', {
+  side: text('side', { enum: ['left', 'right'] }).primaryKey(),
+  model: text('model', { mode: 'json' }).notNull(),
+  version: text('version').notNull(),
+  uploadedAt: integer('uploaded_at', { mode: 'timestamp' }).notNull(),
+  // When set, the side's stages are classified by this model instead of the profile's rules; the rules
+  // remain the fallback whenever the model cannot stage a night.
+  active: integer('active', { mode: 'boolean' }).notNull().default(false),
+})
+
+/** Saved candidates; the legacy per-side row remains the selected model for existing clients. */
+export const stageModelLibrary = sqliteTable('stage_model_library', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  side: text('side', { enum: ['left', 'right'] }).notNull(),
+  model: text('model', { mode: 'json' }).notNull(),
+  version: text('version').notNull(),
+  uploadedAt: integer('uploaded_at', { mode: 'timestamp' }).notNull(),
+}, table => [index('stage_model_library_side_idx').on(table.side)])
+
+export const stageClassifierChanges = sqliteTable('stage_classifier_changes', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  side: text('side', { enum: ['left', 'right'] }).notNull(),
+  changedAt: integer('changed_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  before: text('before', { mode: 'json' }),
+  after: text('after', { mode: 'json' }),
+  // "Wake movement 200 → 240 +2 more"
+  summary: text('summary').notNull(),
+  // Agreement with reference stages (0–1) on the latest night, before and
+  // after the change; null when that night has no reference stages.
+  agreementBefore: real('agreement_before'),
+  agreementAfter: real('agreement_after'),
+}, t => [
+  index('idx_stage_classifier_changes_side_changed_at').on(t.side, t.changedAt),
+])
 
 export const tapGestures = sqliteTable('tap_gestures', {
   id: integer('id').primaryKey({ autoIncrement: true }),
@@ -117,6 +175,7 @@ export const tapGestures = sqliteTable('tap_gestures', {
   temperatureAmount: integer('temperature_amount'), // 0-10
   // For alarm actions
   alarmBehavior: text('alarm_behavior', { enum: ['snooze', 'dismiss'] }),
+  // No longer read: the snooze length is set per alarm (alarm_schedules).
   alarmSnoozeDuration: integer('alarm_snooze_duration'), // 60-600 seconds
   alarmInactiveBehavior: text('alarm_inactive_behavior', {
     enum: ['power', 'none'],
@@ -160,6 +219,25 @@ export const temperatureSchedules = sqliteTable('temperature_schedules', {
     .default(sql`(unixepoch())`),
 }, t => [
   index('idx_temp_schedules_side_day_time').on(t.side, t.dayOfWeek, t.time),
+])
+
+/**
+ * Optional note for a side's curve on one day. A curve is the set of days
+ * sharing set points, so saving a curve writes the same note to each of its
+ * days; the Schedule screen shows the first day's.
+ */
+export const scheduleNotes = sqliteTable('schedule_notes', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  side: text('side', { enum: ['left', 'right'] }).notNull(),
+  dayOfWeek: text('day_of_week', {
+    enum: ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'],
+  }).notNull(),
+  notes: text('notes').notNull(),
+  updatedAt: integer('updated_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, t => [
+  uniqueIndex('idx_schedule_notes_side_day').on(t.side, t.dayOfWeek),
 ])
 
 export const powerSchedules = sqliteTable('power_schedules', {
@@ -214,6 +292,11 @@ export const alarmSchedules = sqliteTable('alarm_schedules', {
   alarmTemperature: real('alarm_temperature').notNull(), // Temperature during alarm
   // Minutes before `time` in which movement fires the alarm early; 0 = off.
   wakeWindow: integer('wake_window').notNull().default(0),
+  // How long a snooze lasts (seconds), and Snooze taper: each later snooze of
+  // the same alarm is this percent shorter (0 = off). Tap gestures and the
+  // HomeKit switch snooze with these.
+  snoozeDuration: integer('snooze_duration').notNull().default(300),
+  snoozeTaper: integer('snooze_taper').notNull().default(0),
   enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
   createdAt: integer('created_at', { mode: 'timestamp' })
     .notNull()
@@ -273,6 +356,35 @@ export const systemHealth = sqliteTable('system_health', {
     .notNull()
     .default(sql`(unixepoch())`),
 })
+
+// ============================================================================
+// Saved curves (named set point lists, not tied to any day or side)
+// ============================================================================
+
+export const curveTemplates = sqliteTable('curve_templates', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  name: text('name').notNull(),
+  bedtime: text('bedtime').notNull(), // HH:mm
+  wake: text('wake').notNull(), // HH:mm
+  points: text('points', { mode: 'json' }).notNull().$type<Record<string, number>>(), // {"HH:mm": tempF}
+  // Column predates the notes name (it held the AI wizard's reasoning).
+  notes: text('reasoning').notNull().default(''),
+  endAction: text('end_action', { enum: ['turn_off', 'maintain'] }).notNull().default('turn_off'),
+  // Days the curve runs on per side. While active, no other active curve
+  // claims the same side and day, and that day's temperature and power rows
+  // are this curve's (src/server/scheduleLibrary.ts).
+  leftDays: text('left_days', { mode: 'json' }).notNull().$type<DayOfWeek[]>().default(sql`'[]'`),
+  rightDays: text('right_days', { mode: 'json' }).notNull().$type<DayOfWeek[]>().default(sql`'[]'`),
+  active: integer('active', { mode: 'boolean' }).notNull().default(false),
+  createdAt: integer('created_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer('updated_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}, t => [
+  uniqueIndex('idx_curve_templates_name').on(t.name),
+])
 
 // ============================================================================
 // Run-Once Sessions (one-off curve application)
@@ -357,3 +469,76 @@ export const baseSchedules = sqliteTable('base_schedules', {
   feedRate: integer('feed_rate').notNull().default(50),
   enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
 }, table => [uniqueIndex('base_schedules_day_time_side').on(table.dayOfWeek, table.time, table.side)])
+
+// Biometric algorithm personalization is configuration, not sensor calibration.
+// Immutable revisions survive biometric-history resets and artifact retention.
+export const biometricProfileRevisions = sqliteTable('biometric_profile_revisions', {
+  id: text('id').primaryKey(),
+  familyId: text('family_id').notNull(),
+  revision: integer('revision').notNull(),
+  side: text('side', { enum: ['left', 'right'] }).notNull(),
+  baseManifestHash: text('base_manifest_hash').notNull(),
+  baseManifest: text('base_manifest', { mode: 'json' }).notNull(),
+  overrides: text('overrides', { mode: 'json' }).notNull(),
+  resolved: text('resolved', { mode: 'json' }).notNull(),
+  resolvedHash: text('resolved_hash').notNull(),
+  dependencyHashes: text('dependency_hashes', { mode: 'json' }).notNull(),
+  parentRevisionId: text('parent_revision_id'),
+  origin: text('origin', { enum: ['manual', 'migration', 'agent', 'system'] }).notNull(),
+  requester: text('requester').notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  requestHash: text('request_hash').notNull(),
+  createdAtMs: integer('created_at_ms').notNull(),
+}, t => [
+  uniqueIndex('uq_biometric_profile_family_revision').on(t.familyId, t.revision),
+  uniqueIndex('uq_biometric_profile_idempotency').on(t.idempotencyKey),
+  index('idx_biometric_profile_side_created').on(t.side, t.createdAtMs),
+])
+
+export const biometricProfileBindings = sqliteTable('biometric_profile_bindings', {
+  side: text('side', { enum: ['left', 'right'] }).primaryKey(),
+  desiredRevisionId: text('desired_revision_id'), // null follows current shipped default
+  generation: integer('generation').notNull(),
+  previousRevisionId: text('previous_revision_id'),
+  updatedAtMs: integer('updated_at_ms').notNull(),
+})
+
+export const biometricActivationEvents = sqliteTable('biometric_activation_events', {
+  id: text('id').primaryKey(),
+  side: text('side', { enum: ['left', 'right'] }).notNull(),
+  generation: integer('generation').notNull(),
+  action: text('action', { enum: ['activate', 'reset', 'rollback', 'migration', 'fallback'] }).notNull(),
+  previousRevisionId: text('previous_revision_id'),
+  nextRevisionId: text('next_revision_id'),
+  previousHash: text('previous_hash').notNull(),
+  nextHash: text('next_hash').notNull(),
+  evaluationId: text('evaluation_id'),
+  evidence: text('evidence', { mode: 'json' }).notNull(),
+  requester: text('requester').notNull(),
+  state: text('state', { enum: ['saved', 'pending_delivery', 'pending_boundary', 'applied', 'failed'] }).notNull(),
+  reason: text('reason'),
+  idempotencyKey: text('idempotency_key').notNull(),
+  requestHash: text('request_hash').notNull(),
+  createdAtMs: integer('created_at_ms').notNull(),
+  updatedAtMs: integer('updated_at_ms').notNull(),
+}, t => [
+  uniqueIndex('uq_biometric_activation_generation').on(t.side, t.generation),
+  uniqueIndex('uq_biometric_activation_idempotency').on(t.idempotencyKey),
+])
+
+export const biometricConfigOutbox = sqliteTable('biometric_config_outbox', {
+  id: text('id').primaryKey(),
+  side: text('side', { enum: ['left', 'right'] }).notNull(),
+  generation: integer('generation').notNull(),
+  payload: text('payload', { mode: 'json' }).notNull(),
+  resolvedHash: text('resolved_hash').notNull(),
+  state: text('state', { enum: ['pending', 'delivered', 'failed'] }).notNull(),
+  attempts: integer('attempts').notNull().default(0),
+  nextAttemptAtMs: integer('next_attempt_at_ms').notNull(),
+  lastError: text('last_error'),
+  createdAtMs: integer('created_at_ms').notNull(),
+  deliveredAtMs: integer('delivered_at_ms'),
+}, t => [
+  uniqueIndex('uq_biometric_outbox_generation').on(t.side, t.generation),
+  index('idx_biometric_outbox_pending').on(t.state, t.nextAttemptAtMs),
+])
