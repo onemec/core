@@ -401,6 +401,7 @@ const ALL_SENSOR_TYPES = [
   'piezo-dual', 'capSense', 'capSense2',
   'bedTemp', 'bedTemp2', 'frzTemp', 'frzTherm', 'frzHealth', 'log',
   'deviceStatus', 'gesture', 'lps',
+  'frzWater', 'sensHealth',
 ] as const
 
 /**
