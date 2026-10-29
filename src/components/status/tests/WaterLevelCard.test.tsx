@@ -71,8 +71,17 @@ it('renders capacitive gauge and needs priming state when frzWater is present', 
   expect(screen.getByText('3/5')).toBeTruthy()
   expect(screen.getByText('Needs priming')).toBeTruthy()
 
+  // When frzWater indicates priming is in progress
+  mock.frzWater = { capLevel: 3, capValid: true, hasWater: true, isPriming: true, needsPriming: false }
+  mock.status = { isPriming: false }
+  rerender(<WaterLevelCard onOpen={() => {}} />)
+  expect(screen.getByText('Priming…')).toBeTruthy()
+  expect((screen.getByRole('button', { name: /start prime/i }) as HTMLButtonElement).disabled).toBe(true)
+
   // When frzWater is absent, falls back to binary state without gauge
   mock.frzWater = undefined
+  mock.status = { isPriming: false, primeCompletedNotification: { timestamp: new Date(2026, 9, 20).toISOString() } }
   rerender(<WaterLevelCard onOpen={() => {}} />)
   expect(screen.queryByTestId('water-tank-gauge')).toBeNull()
+  expect(screen.getByText(/Last primed/)).toBeTruthy()
 })

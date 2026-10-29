@@ -105,6 +105,24 @@ it('shows stored and live freezer readings, water warnings and pump RPM', () => 
   rerender(<FreezerHealthCard />)
   expect(screen.getAllByText('Priming')).toHaveLength(2)
   expect(screen.getByText(/priming…/)).toBeTruthy()
+
+  // When tank needs priming
+  mock.frames.frzWater = { type: 'frzWater', capLevel: 3, capValid: true, hasWater: true, isPriming: false, needsPriming: true }
+  rerender(<FreezerHealthCard />)
+  expect(screen.getAllByText('Needs prime')).toHaveLength(2)
+  expect(screen.getByText(/fan.*needs prime/)).toBeTruthy()
+
+  // When capValid is false and hasWater is true
+  mock.frames.frzWater = { type: 'frzWater', capLevel: 0, capValid: false, hasWater: true, isPriming: false, needsPriming: false }
+  rerender(<FreezerHealthCard />)
+  expect(screen.getAllByText('Normal')).toHaveLength(2)
+  expect(screen.getByText(/fan.*water ok/)).toBeTruthy()
+
+  // When capValid is false and hasWater is false
+  mock.frames.frzWater = { type: 'frzWater', capLevel: 0, capValid: false, hasWater: false, isPriming: false, needsPriming: false }
+  rerender(<FreezerHealthCard />)
+  expect(screen.getAllByText('Water low')).toHaveLength(2)
+  expect(screen.getByText(/fan.*water low/)).toBeTruthy()
 })
 
 it('uses server occupancy while visualizing frame variance independently', () => {
