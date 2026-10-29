@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   summary: undefined as unknown,
   timeFormat: '12h' as '12h' | '24h',
   sensHealth: undefined as unknown,
+  deviceStatus: undefined as unknown,
   // 8 PM local on a Monday: inside tonight's 5 PM → 9 AM window.
   nowMinute: Math.floor(new Date(2026, 8, 28, 20, 0).getTime() / 60_000),
 }))
@@ -65,6 +66,7 @@ vi.mock('@/src/utils/trpc', () => {
       if (key === 'health.dataPath') return { data: mocks.dataPath }
       if (key === 'health.maintenance') return { data: mocks.maintenance }
       if (key === 'health.system') return { data: { scheduler: { drift: { drifted: false } } } }
+      if (key === 'device.getStatus') return { data: mocks.deviceStatus }
       if (key === 'waterLevel.getLatest') return { data: mocks.water }
       if (key === 'schedules.getAll') return { data: mocks.schedules[input?.side ?? ''] }
       if (key === 'health.thermal') return { data: mocks.thermal, isLoading: false, isFetching: false, error: null, dataUpdatedAt: 1 }
@@ -159,6 +161,7 @@ describe('DiagnosticsConsole dashboard', () => {
     mocks.water = { level: 'ok' }
     mocks.mutations = {}
     mocks.sensHealth = undefined
+    mocks.deviceStatus = undefined
     mocks.schedules = {
       left: { temperature: [
         { dayOfWeek: 'monday', time: '23:15', temperature: 80, enabled: true },
@@ -249,6 +252,8 @@ describe('DiagnosticsConsole dashboard', () => {
 
   it('warns when a cover sensor is disconnected according to sensHealth', () => {
     single.sides = ['left', 'right']
+    mocks.water = undefined
+    mocks.deviceStatus = { waterLevel: 'ok' }
     mocks.sensHealth = { type: 'sensHealth', version: 1, left: { connected: false }, right: { connected: true } }
     render(<DiagnosticsConsole section="dashboard" onJump={vi.fn()} />)
     const card = screen.getByTestId('attention')
@@ -261,6 +266,18 @@ describe('DiagnosticsConsole dashboard', () => {
     render(<DiagnosticsConsole section="dashboard" onJump={vi.fn()} />)
     const card = screen.getByTestId('attention')
     expect(within(card).getByText('Both cover sensors disconnected')).toBeTruthy()
+  })
+
+  it('ignores disconnected sensor for a side that is not shown', () => {
+    single.sides = ['right']
+    mocks.sensHealth = { type: 'sensHealth', version: 1, left: { connected: false }, right: { connected: true } }
+    render(<DiagnosticsConsole section="dashboard" onJump={vi.fn()} />)
+    expect(screen.queryByTestId('attention')).toBeNull()
+
+    single.sides = ['left']
+    mocks.sensHealth = { type: 'sensHealth', version: 1, left: { connected: true }, right: { connected: false } }
+    render(<DiagnosticsConsole section="dashboard" onJump={vi.fn()} />)
+    expect(screen.queryByTestId('attention')).toBeNull()
   })
 
   it('shows only the sleeper\'s side when the other is away', () => {
