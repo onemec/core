@@ -112,6 +112,20 @@ it('uses server occupancy while visualizing frame variance independently', () =>
   expect(screen.getByTestId('presence-right').textContent).toContain('in bedstill')
 })
 
+it('warns when a cover sensor is disconnected according to sensHealth', () => {
+  mock.frames.sensHealth = { type: 'sensHealth', left: { connected: false }, right: { connected: true } }
+  mock.data.occupancy = { left: { occupied: false, available: true, classification: 'none', movement: { active: false } }, right: { occupied: false, available: true, classification: 'none', movement: { active: false } } }
+  const { rerender } = render(<PresenceCard />)
+  expect(screen.getByTestId('presence-left').textContent).toContain('disconnected')
+  expect(screen.getByTestId('presence-left').textContent).toContain('cover disconnected')
+  expect(screen.getByTestId('presence-right').textContent).not.toContain('disconnected')
+
+  // When sensHealth is absent (older firmware), it does not show disconnected
+  delete mock.frames.sensHealth
+  rerender(<PresenceCard />)
+  expect(screen.getByTestId('presence-left').textContent).not.toContain('disconnected')
+})
+
 it('switches flow units and ranges with live readings and downsampled history', () => {
   const { rerender } = render(<FlowrateChart />)
   expect(screen.getByText('No flow history')).toBeTruthy()
