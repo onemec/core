@@ -76,6 +76,16 @@ describe('freezerStatus', () => {
     expect(freezerStatus(health({ fan: 0, fanDuty: 0 }), 'ok', true).label).toBe('Normal')
     expect(freezerStatus(health({ fan: 100, fanDuty: 50 }), 'ok', true).label).toBe('Normal')
   })
+
+  it('evaluates water level and priming state when frzWater frame is available', () => {
+    const baseWater = { type: 'frzWater' as const, ts: 1, capLevel: 4, capValid: true, hasWater: true, isPriming: false, needsPriming: false }
+    expect(freezerStatus(health(), 'ok', true, { ...baseWater, capLevel: 1 })).toEqual({ tone: 'warn', label: 'Water low' })
+    expect(freezerStatus(health(), 'ok', true, { ...baseWater, capLevel: 4 })).toEqual({ tone: 'ok', label: 'Normal' })
+    expect(freezerStatus(health(), 'ok', true, { ...baseWater, isPriming: true })).toEqual({ tone: 'ok', label: 'Priming' })
+    expect(freezerStatus(health(), 'ok', true, { ...baseWater, needsPriming: true })).toEqual({ tone: 'warn', label: 'Needs prime' })
+    expect(freezerStatus(health(), 'ok', true, { ...baseWater, capValid: false, hasWater: false })).toEqual({ tone: 'warn', label: 'Water low' })
+    expect(freezerStatus(health(), 'ok', true, { ...baseWater, capValid: false, hasWater: true })).toEqual({ tone: 'ok', label: 'Normal' })
+  })
 })
 
 describe('zoneActivity', () => {
